@@ -1,0 +1,98 @@
+[W1116 08:48:43.742073076 FunctionLoader.cpp:48] Warning: LD_PRELOAD detected, FunctionLoader prefers RTLD_DEFAULT for symbol resolution. (function operator())
+INFO 11-16 08:48:47 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 11-16 08:48:47 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 11-16 08:48:47 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-16 08:48:47 [__init__.py:237] Platform plugin ascend is activated
+INFO 11-16 08:48:47 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+2026-11-16 08:48:53,987 - 3439 - ServiceProfiler - INFO - VLLM_USE_V1 not set, auto-detected via vLLM 0.26.0+empty: default 1
+[MM_CPU_PREPROCESS] module imported
+INFO 11-16 08:48:55 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 11-16 08:48:55 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+INFO 11-16 08:48:55 [api_utils.py:273] non-default args: {'tokenizer': './qwen', 'dtype': 'bfloat16', 'max_model_len': 8211, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.8, 'max_num_seqs': 16, 'disable_log_stats': True, 'compilation_config': {'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'vllm_ascend.compilation.compiler_interface.AscendCompiler', 'custom_ops': [], 'ir_enable_torch_wrap': None, 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [1], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}, 'profiler_config': ProfilerConfig(profiler='torch', torch_profiler_dir='/tmp/qwen3_npu_decode_profile', torch_profiler_with_stack=False, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, capture_torch_profiler=False, detailed_trace_annotation=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0), 'model': './qwen'}
+INFO 11-16 08:48:55 [model.py:623] Resolved architecture: Qwen3ForCausalLM
+INFO 11-16 08:48:55 [model.py:1788] Using max model len 8211
+INFO 11-16 08:48:55 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 11-16 08:48:55 [vllm.py:1109] Asynchronous scheduling is enabled.
+INFO 11-16 08:48:55 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 11-16 08:48:55 [utils.py:174] No quantization signature detected from model files for "./qwen". The model will be loaded as float. To force a quantization method, pass "--quantization <method>" explicitly.
+INFO 11-16 08:48:55 [ascend_config.py:927] Dynamic EPLB is False
+INFO 11-16 08:48:55 [ascend_config.py:928] The number of redundant experts is 0
+INFO 11-16 08:48:55 [utils.py:1275] Block size is set to 128 if prefix cache or chunked prefill is enabled.
+INFO 11-16 08:48:55 [platform.py:785] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+INFO 11-16 08:48:55 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+WARNING 11-16 08:48:59 [warnings.py:112] /usr/local/python3.12.13/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=3439) is multi-threaded, use of fork() may lead to deadlocks in the child.
+(EngineCore pid=4050) INFO 11-16 08:48:59 [core.py:116] Initializing a V1 LLM engine (v0.26.0) with config: model='./qwen', speculative_config=None, tokenizer='./qwen', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=8211, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=None, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=./qwen, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'vllm_ascend.compilation.compiler_interface.AscendCompiler', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 1, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=4050) INFO 11-16 08:49:06 [parallel_state.py:1615] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.244.229.123:39265 backend=hccl
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+(EngineCore pid=4050) INFO 11-16 08:49:06 [parallel_state.py:1946] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[rank0]:[W1116 08:49:06.784640135 NPUCachingAllocator.cpp:202] Warning: The current CANN and HDK(driver) versions require processing for 32 padding size, with memory allocation. (function operator())
+(EngineCore pid=4050) WARNING 11-16 08:49:07 [utils.py:1130] The max_cudagraph_capture_size (1) is smaller than the potential max tokens required for decode (16). This may lead to suboptimal performance. Consider adjustingmax_cudagraph_capture_size or scheduler_config (max_num_batched_tokens or max_num_seqs)to ensure max_cudagraph_capture_size can accommodate the decode workload. For more details, see the issue #8240(https://github.com/vllm-project/vllm-ascend/issues/8240).
+(EngineCore pid=4050) INFO 11-16 08:49:07 [model_runner_v1.py:4309] Starting to load model ./qwen...
+(EngineCore pid=4050) INFO 11-16 08:49:07 [compilation.py:1091] Using OOT custom backend for compilation.
+(EngineCore pid=4050) INFO 11-16 08:49:07 [compilation.py:1091] Using OOT custom backend for compilation.
+(EngineCore pid=4050) INFO 11-16 08:49:07 [weight_utils.py:869] Filesystem type for checkpoints: GPFS. Checkpoint size: 27.51 GiB. Available RAM: 1811.79 GiB.
+(EngineCore pid=4050) INFO 11-16 08:49:07 [weight_utils.py:892] Auto-prefetch is disabled because the filesystem (GPFS) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=4050) Loading safetensors checkpoint shards:   0% Completed | 0/8 [00:00<?, ?it/s]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  12% Completed | 1/8 [00:03<00:27,  3.94s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  25% Completed | 2/8 [00:08<00:24,  4.12s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  38% Completed | 3/8 [00:12<00:20,  4.18s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  50% Completed | 4/8 [00:16<00:16,  4.23s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  62% Completed | 5/8 [00:20<00:12,  4.20s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  75% Completed | 6/8 [00:24<00:08,  4.16s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards:  88% Completed | 7/8 [00:29<00:04,  4.14s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards: 100% Completed | 8/8 [00:31<00:00,  3.47s/it]
+(EngineCore pid=4050) Loading safetensors checkpoint shards: 100% Completed | 8/8 [00:31<00:00,  3.89s/it]
+(EngineCore pid=4050) 
+(EngineCore pid=4050) INFO 11-16 08:49:39 [default_loader.py:430] Loading weights took 31.18 seconds
+(EngineCore pid=4050) INFO 11-16 08:49:39 [model_runner_v1.py:4405] Loading model weights took 27.5376 GB
+(EngineCore pid=4050) INFO 11-16 08:49:39 [model_runner_v1.py:4437] Model runner load_model total time: 32.66 seconds
+(EngineCore pid=4050) INFO 11-16 08:49:41 [compiler_interface.py:248] AscendCompiler hash factors: {'torch_npu_version': '2.10.0.post4', 'enable_npugraph_ex': True, 'enable_static_kernel': False}
+(EngineCore pid=4050) INFO 11-16 08:49:41 [backends.py:1094] Using cache directory: /root/.cache/vllm/torch_compile_cache/fe7630838d/rank_0_0/backbone for vLLM's torch.compile
+(EngineCore pid=4050) INFO 11-16 08:49:41 [backends.py:1155] Dynamo bytecode transform time: 1.40 s
+(EngineCore pid=4050) INFO 11-16 08:49:42 [compiler_interface.py:353] Loaded npugraph_ex compilation cache from /root/.cache/vllm/torch_compile_cache/fe7630838d/rank_0_0/backbone/artifact_compile_range_1_8192_subgraph_0
+(EngineCore pid=4050) INFO 11-16 08:49:43 [backends.py:292] Directly load the compiled graph(s) for compile range (1, 8192) from the cache, took 0.058 s
+(EngineCore pid=4050) INFO 11-16 08:49:43 [decorators.py:311] Directly load AOT compilation from path /root/.cache/vllm/torch_compile_cache/torch_aot_compile/33999587a15bff7ae334adac9735461e88eef24ddd8fd2233c63ecad89db6604/rank_0_0/model
+(EngineCore pid=4050) INFO 11-16 08:49:43 [monitor.py:53] torch.compile took 2.82 s in total
+(EngineCore pid=4050) INFO 11-16 08:49:43 [monitor.py:81] Initial profiling/warmup run took 0.10 s
+(EngineCore pid=4050) INFO 11-16 08:49:44 [worker.py:598] Available KV cache memory: 20.31 GiB
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kv_cache_utils.py:2177] GPU KV cache size: 131,249 tokens
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kv_cache_utils.py:2178] Maximum concurrency for 8,211 tokens per request: 15.98x
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kernel_warmup.py:41] Starting Triton kernel warmup.
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kernel_warmup.py:33] rejection_sampler Triton warmup complete in 0.000s.
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kernel_warmup.py:33] penalties Triton warmup complete in 0.019s.
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kernel_warmup.py:33] rms Triton warmup complete in 0.000s.
+(EngineCore pid=4050) INFO 11-16 08:49:44 [kernel_warmup.py:49] Triton kernel warmup finished in 0.020s.
+(EngineCore pid=4050) INFO 11-16 08:49:44 [gpu_model_runner.py:6798] Rank 0: Torch profiler disabled for CUDA graph capture
+(EngineCore pid=4050) Capturing CUDA graphs (decode, FULL):   0%|          | 0/1 [00:00<?, ?it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 1/1 [00:00<00:00,  6.04it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 1/1 [00:00<00:00,  6.03it/s]
+(EngineCore pid=4050) INFO 11-16 08:49:45 [gpu_model_runner.py:6844] Graph capturing finished in 1 secs, took 0.48 GiB
+(EngineCore pid=4050) INFO 11-16 08:49:45 [worker.py:819] Free memory on device (60.59/60.96 GiB) on startup. Desired GPU memory utilization is (0.8, 48.77 GiB). Actual usage: 27.54 GiB for weights, 0.89 GiB for peak activation, 0.03 GiB for non-torch memory, 0.48 GiB for NPU graph memory. Replace gpu_memory_utilization with `--kv-cache-memory=21134025728` (19.68 GiB) to fit into requested memory, or `--kv-cache-memory=33830138880` (31.51 GiB) to fully utilize NPU free memory. Current KV cache memory: 20.31 GiB. After warmup: torch reserved memory 48.38 GiB, torch allocated memory 47.92 GiB.
+(EngineCore pid=4050) INFO 11-16 08:49:45 [cpu_binding.py:800] CPU binding skipped: non-ARM CPU detected.
+(EngineCore pid=4050) INFO 11-16 08:49:45 [core.py:340] init engine (profile, create kv cache, warmup model) took 5.94 s (compilation: 2.82 s)
+(EngineCore pid=4050) INFO 11-16 08:49:46 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(EngineCore pid=4050) INFO 11-16 08:49:46 [utils.py:174] No quantization signature detected from model files for "./qwen". The model will be loaded as float. To force a quantization method, pass "--quantization <method>" explicitly.
+(EngineCore pid=4050) INFO 11-16 08:49:46 [platform.py:785] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 42.03it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=4050) INFO 11-16 08:49:46 [acl_graph.py:249] Replaying aclgraph
+Processed prompts: 100%|██████████| 1/1 [00:01<00:00,  1.05s/it, est. speed input: 7765.29 toks/s, output: 2.84 toks/s]Processed prompts: 100%|██████████| 1/1 [00:01<00:00,  1.05s/it, est. speed input: 7765.29 toks/s, output: 2.84 toks/s]Processed prompts: 100%|██████████| 1/1 [00:01<00:00,  1.06s/it, est. speed input: 7765.29 toks/s, output: 2.84 toks/s]
+(EngineCore pid=4050) [2026-11-16 08:49:47] [WARNING] [4050] profiler.py: Incorrect schedule: Stop profiler while current state is RECORD which may result in incomplete parsed data.
+(EngineCore pid=4050) WARNING 11-16 08:49:47 [warnings.py:112] /usr/local/python3.12.13/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=4050) is multi-threaded, use of fork() may lead to deadlocks in the child.
+(EngineCore pid=4050) [2026-11-16 08:49:47] [INFO] [5750] profiler.py: Start parsing profiling data in sync mode at: /tmp/qwen3_npu_decode_profile/rank0_4050_20261116084946146_ascend_pt
+(EngineCore pid=4050) |WARNING 11-16 08:49:48 [warnings.py:112] /usr/local/python3.12.13/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=5750) is multi-threaded, use of fork() may lead to deadlocks in the child.
+(EngineCore pid=4050) /-[2026-11-16 08:49:50] [INFO] [5759] profiler.py: CANN profiling data parsed in a total time of 0:00:02.024802
+(EngineCore pid=4050) \[2026-11-16 08:49:51] [INFO] [5750] profiler.py: All profiling data parsed in a total time of 0:00:03.329581
+(EngineCore pid=4050) INFO 11-16 08:49:52 [wrapper.py:66] Profiler stopped successfully.
+输入 token 数: 8192
+生成 token IDs: [785, 22670, 26674]
+(EngineCore pid=4050) INFO 11-16 08:49:52 [core.py:1313] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=4050) INFO 11-16 08:49:52 [core.py:1432] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=4050) INFO 11-16 08:49:52 [core.py:1463] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=4050) INFO 11-16 08:49:52 [core.py:1326] [shutdown] EngineCore: exiting busy loop
+(EngineCore pid=4050) INFO 11-16 08:49:52 [wrapper.py:142] Shutting down profiler
+(EngineCore pid=4050) WARNING 11-16 08:49:52 [parallel_state.py:2142] torch._C._host_emptyCache() only available in Pytorch >=2.5
+WARNING 11-16 08:49:53 [core_client.py:702] [shutdown] MPClient: engine core exited unexpectedly; starting cleanup
