@@ -8,11 +8,10 @@
 
 constexpr int TILE = 128;
 
-__global__ __aicore__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
+__global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
     GM_ADDR old_sum, GM_ADDR probs, GM_ADDR alpha, GM_ADDR new_max, GM_ADDR new_sum,
     uint32_t rows, uint32_t rows_per_head, uint32_t key_start, float scale)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::GlobalTensor<half> s, p;
     AscendC::GlobalTensor<float> om, os, a, nm, ns;
     s.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(scores));
