@@ -16,10 +16,16 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
 }
 
 template <uint32_t BM, uint32_t BN>
-constexpr uint32_t UbBytes() {
-    return 2 * BM * D * sizeof(half) + 2 * BM * D * sizeof(float)
+struct UbLayout {
+    static constexpr uint32_t bytes =
+        2 * BM * D * sizeof(half) + 2 * BM * D * sizeof(float)
         + 2 * BN * D * sizeof(half) + 3 * BN * D * sizeof(float)
         + (2 * BN + BN + BN * 8 + 2 * BM) * sizeof(float);
+};
+
+template <uint32_t BM, uint32_t BN>
+constexpr uint32_t UbBytes() {
+    return UbLayout<BM, BN>::bytes;
 }
 
 template <uint32_t BM, uint32_t BN>
@@ -28,7 +34,7 @@ __global__ __vector__ void fused_causal_attention(
 {
     static_assert((BM == 8 || BM == 16) && (BN == 32 || BN == 64));
     static_assert(BN % BM == 0);
-    static_assert(UbBytes<BM, BN>() <= 180 * 1024, "UB budget exceeded");
+    static_assert(UbLayout<BM, BN>::bytes <= 180 * 1024, "UB budget exceeded");
     AscendC::GlobalTensor<half> qgm, kgm, vgm, ogm;
     qgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(q), uint64_t(heads) * seq * D);
     kgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k), uint64_t(heads) * seq * D);
