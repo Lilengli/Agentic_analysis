@@ -16,7 +16,10 @@ python compare_attention.py --output attention_compare_results.json
 It compares migrated Triton, PyTorch SDPA and the official example using the
 same CPU-seeded FP16 inputs `(1,2,128,128)`, causal mask, scale `1/sqrt(128)`,
 and dropout zero. Each output must pass an FP32 CPU reference with atol and rtol
-0.02 before timings are accepted. Calls are warmed and interleaved; the NPU
+0.02 before timings are accepted. For sequence lengths at most 512, all query
+rows are checked; longer sequences check 32 deterministic, evenly spaced query
+rows (reported in JSON). This is not full long-sequence correctness validation.
+Calls are warmed and interleaved; the NPU
 event range measures the complete function call, including device operations
 for setup, and the synchronized host wall time is reported separately. Results
 contain per-sample times and environment versions. This is eager execution,
