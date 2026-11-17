@@ -1,0 +1,4 @@
+index,name,type,stream,relative_start_us,duration_us,input_shapes
+1,aclnnInplaceOne_OnesLikeAiCore_OnesLike,OnesLike,2,0.000,7.661,"""2048,2048"""
+2,aclnnTriu_Triu_Triu,Triu,2,7.681,21.341,"""2048,2048"""
+3,aclnnFlashAttentionScore_FlashAttentionScore_FlashAttentionScore,FlashAttentionScore,2,579.284,25.421,"""1,2,128,128;1,2,128,128;1,2,128,128;;;;2048,2048;;;;;;;;;"""

@@ -1,0 +1,2 @@
+index,name,type,stream,relative_start_us,duration_us,input_shapes
+1,_causal_attention_kernel,_causal_attention_kernel,2,0.000,19.901,"""1,2,128,128;1,2,128,128;1,2,128,128"""
