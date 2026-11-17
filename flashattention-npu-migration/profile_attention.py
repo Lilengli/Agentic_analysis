@@ -61,8 +61,7 @@ def main():
         if not passed:
             raise SystemExit('Correctness check failed; profiling skipped')
         for _ in range(args.warmup):
-            for _ in range(args.calls):
-                result = run()
+            result = run()
         torch.npu.synchronize()
 
         config = torch_npu.profiler._ExperimentalConfig(
@@ -77,7 +76,8 @@ def main():
             with_stack=False,
             experimental_config=config,
         ):
-            result = run()
+            for _ in range(args.calls):
+                result = run()
             torch.npu.synchronize()
 
     print(f'Profiling completed: impl={args.impl}, directory={output}', flush=True)
