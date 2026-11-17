@@ -138,13 +138,19 @@ def _causal_attention_kernel(
     )
 
 
-def kernel_function(q, k, v):
+def kernel_function(q, k, v, *, block_m=32, block_n=32):
     """Return causal FP16 attention for tensors shaped [batch, heads, N, D].
 
+    block_m/block_n set the query/key tile sizes. The defaults preserve the
+    original 32x32 configuration. Supported sizes still depend on the NPU
+    compiler and resource limits, and must be checked on the target device.
     One fused Triton kernel computes scaled QK^T, causal masking, stable
     online softmax, and multiplication by V without intermediate global
     tensors. The wrapper only validates inputs, allocates, and launches.
     """
+    if (block_m not in (16, 32, 64, 128) or block_n not in (16, 32, 64, 128)
+            or block_m < block_n):
+        raise ValueError('block sizes must be 16, 32, 64 or 128 and block_m >= block_n')
     for tensor in (q, k, v):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError("q, k, and v must be torch.Tensor instances.")
@@ -168,13 +174,12 @@ def kernel_function(q, k, v):
     if batch == 0 or heads == 0 or sequence_length == 0:
         return output
 
-    # The GPU launch used a two-dimensional grid and autotuning. This first
-    # Ascend candidate uses one dimension and a fixed tile for validation.
-    grid = (triton.cdiv(sequence_length, 32) * batch * heads,)
+    # One program per query tile and head. Tile choice is manual, not autotuned.
+    grid = (triton.cdiv(sequence_length, block_m) * batch * heads,)
     _causal_attention_kernel[grid](
         q, k, v, output, heads, sequence_length, head_dimension,
         *q.stride(), *k.stride(), *v.stride(),
         BLOCK_D=max(16, triton.next_power_of_2(head_dimension)),
-        BLOCK_M=32, BLOCK_N=32,
+        BLOCK_M=block_m, BLOCK_N=block_n,
     )
     return output
