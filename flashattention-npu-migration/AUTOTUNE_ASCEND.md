@@ -1,15 +1,18 @@
 # Experimental Ascend attention autotuning
 
 `flash_attention_ascend_autotune.py` wraps the same migrated Triton kernel in
-`triton.autotune` with explicit candidates: 32x32, 64x32, 64x64, 128x64.
+`triton.autotune` with default candidates: 32x32, 64x32, 64x64, 128x64.
+The benchmark can select experimental larger candidates with `--tiles`, for
+example `--tiles 128x64 128x128 256x32 256x64 256x128`. Run large configurations
+one at a time initially because compilation may fail, hang or fault the device.
 It first compiles/runs and checks each candidate against a CPU FP32 causal
 reference for the calibration input; only candidates passing the check are
 sent to Triton's autotuner. For length >512 the check covers 64 query rows,
 not the entire output. Failed configurations are reported. A device-side fault
 may invalidate the NPU process; failures are not guaranteed recoverable.
 
-The in-process cache key includes device, dtype, shape, all input strides and
-validation settings. A new input value with the same key reuses the selected
+The in-process cache key includes device, dtype, shape, all input strides,
+candidate tiles and validation settings. A new input value with the same key reuses the selected
 configuration; calibration therefore cannot prove correctness for all inputs.
 This prototype is not thread-safe, does not support graph capture on the first
 call, and has not been validated on the target NPU. The first call includes CPU

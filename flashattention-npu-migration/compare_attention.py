@@ -32,8 +32,8 @@ def main():
         parser.error('all numeric options must be positive')
     if a.dim not in (16, 32, 64, 128, 256):
         parser.error('official example requires dim in {16,32,64,128,256}')
-    if a.block_m not in (16, 32, 64, 128) or a.block_n not in (16, 32, 64, 128):
-        parser.error('block sizes must be 16, 32, 64 or 128')
+    if a.block_m not in (16, 32, 64, 128, 256) or a.block_n not in (16, 32, 64, 128, 256):
+        parser.error('block sizes must be 16, 32, 64, 128 or 256')
     if a.seq % a.block_m or a.seq % a.block_n or a.block_m < a.block_n:
         parser.error('use seq divisible by block-m and block-n, and block-m >= block-n')
 

@@ -13,10 +13,21 @@ def main():
     p.add_argument('--seq', type=int, default=128)
     p.add_argument('--warmup', type=int, default=5)
     p.add_argument('--repeats', type=int, default=30)
+    p.add_argument('--tiles', nargs='+', default=None,
+                   help='candidate tiles, e.g. 128x64 128x128 256x64')
     p.add_argument('--output', default='autotune_results.json')
     a = p.parse_args()
     if min(a.seq, a.warmup, a.repeats) < 1:
         p.error('seq, warmup and repeats must be positive')
+    tiles = None
+    if a.tiles is not None:
+        try:
+            tiles = tuple(tuple(int(x) for x in t.lower().split('x')) for t in a.tiles)
+        except ValueError:
+            p.error('tile format must be MxN, e.g. 128x64')
+        if any(len(x) != 2 or x[0] not in (16,32,64,128,256) or x[1] not in (16,32,64,128,256)
+               or x[0] < x[1] for x in tiles) or len(set(tiles)) != len(tiles):
+            p.error('tiles must be unique, powers of two from 16 to 256, and M >= N')
 
     import torch
     import torch_npu
@@ -36,17 +47,17 @@ def main():
                'methods': {}}
     with torch.inference_mode():
         t0 = time.monotonic()
-        auto = autotuned_attention(q, k, v)
+        auto = autotuned_attention(q, k, v, candidates=tiles)
         torch.npu.synchronize()
         results['first_call_seconds'] = time.monotonic() - t0
-        results['autotune'] = tuning_report(q, k, v)
+        results['autotune'] = tuning_report(q, k, v, candidates=tiles)
         print('calibration result:', json.dumps(results['autotune'], ensure_ascii=False), flush=True)
         # Check the selected configuration against a second, different input of
         # the same shape; autotune cache should be reused without recalibration.
         torch.manual_seed(4321)
         q2, k2, v2 = [torch.randn(shape, dtype=torch.float16).to('npu:0') for _ in range(3)]
         rows, reference = _reference(q2, k2, v2, 64)
-        out = autotuned_attention(q2, k2, v2)
+        out = autotuned_attention(q2, k2, v2, candidates=tiles)
         torch.npu.synchronize()
         selected = out.cpu().float().index_select(2, rows)
         passed = bool(torch.allclose(selected, reference, atol=0.002, rtol=0.01))
@@ -57,7 +68,7 @@ def main():
             Path(a.output).write_text(json.dumps(results, indent=2), encoding='utf-8')
             raise SystemExit('Selected config failed second-input check; timing skipped')
 
-        methods = {'autotune': lambda: autotuned_attention(q, k, v),
+        methods = {'autotune': lambda: autotuned_attention(q, k, v, candidates=tiles),
                    'sdpa': lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)}
         for bm, bn in ((32, 32), (128, 64)):
             if any(x['block_m'] == bm and x['block_n'] == bn and x['correct']

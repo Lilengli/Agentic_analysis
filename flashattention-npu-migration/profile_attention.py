@@ -32,9 +32,9 @@ def main():
     if args.impl == 'official' and (args.dim not in (16, 32, 64, 128, 256)
             or args.block_m < args.block_n or args.seq % args.block_m or args.seq % args.block_n):
         parser.error('official requires supported dim, block-m >= block-n and seq divisible by both blocks')
-    if args.impl in ('triton', 'official') and (args.block_m not in (16, 32, 64, 128)
-            or args.block_n not in (16, 32, 64, 128) or args.block_m < args.block_n):
-        parser.error('block sizes must be 16, 32, 64 or 128 and block-m >= block-n')
+    if args.impl in ('triton', 'official') and (args.block_m not in (16, 32, 64, 128, 256)
+            or args.block_n not in (16, 32, 64, 128, 256) or args.block_m < args.block_n):
+        parser.error('block sizes must be 16, 32, 64, 128 or 256 and block-m >= block-n')
     if not torch.npu.is_available():
         raise RuntimeError('No NPU is visible')
     output = Path(args.output).expanduser().resolve()

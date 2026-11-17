@@ -148,9 +148,9 @@ def kernel_function(q, k, v, *, block_m=32, block_n=32):
     online softmax, and multiplication by V without intermediate global
     tensors. The wrapper only validates inputs, allocates, and launches.
     """
-    if (block_m not in (16, 32, 64, 128) or block_n not in (16, 32, 64, 128)
+    if (block_m not in (16, 32, 64, 128, 256) or block_n not in (16, 32, 64, 128, 256)
             or block_m < block_n):
-        raise ValueError('block sizes must be 16, 32, 64 or 128 and block_m >= block_n')
+        raise ValueError('block sizes must be 16, 32, 64, 128 or 256 and block_m >= block_n')
     for tensor in (q, k, v):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError("q, k, and v must be torch.Tensor instances.")

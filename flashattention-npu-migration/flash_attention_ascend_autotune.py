@@ -47,7 +47,17 @@ def _launch(tuner, q, k, v):
     return out
 
 
-def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
+def _candidate_key(candidates):
+    values = tuple(tuple(pair) for pair in (candidates if candidates is not None else _CANDIDATES))
+    if not values or len(set(values)) != len(values):
+        raise ValueError('candidate list must be nonempty and have no duplicates')
+    if any(len(pair) != 2 or pair[0] not in (16, 32, 64, 128, 256)
+           or pair[1] not in (16, 32, 64, 128, 256) or pair[0] < pair[1] for pair in values):
+        raise ValueError('invalid candidate: use powers of two 16..256 with block_m >= block_n')
+    return values
+
+
+def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01, candidates=None):
     """Run causal FP16 attention, calibrating and autotuning on the first call.
 
     First-call output must not be used for steady-state timing. Fixed candidate
@@ -61,13 +71,14 @@ def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
         raise ValueError('q, k, v must have the same shape and device')
     if min(q.shape) < 1 or q.shape[-1] > 256 or reference_rows < 1 or atol < 0 or rtol < 0:
         raise ValueError('shape/reference_rows/tolerances outside supported range')
-    key = (_workload_key(q, k, v), int(reference_rows), float(atol), float(rtol))
+    candidate_key = _candidate_key(candidates)
+    key = (_workload_key(q, k, v), int(reference_rows), float(atol), float(rtol), candidate_key)
     if key not in _CACHE:
         started = time.monotonic()
         rows, reference = _reference(q, k, v, reference_rows)
-        candidates = []
+        candidate_reports = []
         valid = []
-        for bm, bn in _CANDIDATES:
+        for bm, bn in candidate_key:
             item = {'block_m': bm, 'block_n': bn}
             try:
                 actual = kernel_function(q, k, v, block_m=bm, block_n=bn)
@@ -79,10 +90,10 @@ def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
                     valid.append((bm, bn))
             except Exception as exc:
                 item.update(correct=False, error=repr(exc))
-            candidates.append(item)
+            candidate_reports.append(item)
             print(f'autotune candidate {bm}x{bn}: {item}', flush=True)
         if not valid:
-            raise RuntimeError(f'No autotune candidates passed correctness: {candidates}')
+            raise RuntimeError(f'No autotune candidates passed correctness: {candidate_reports}')
         tuner = _make_autotuner(valid)
         # First call benchmarks candidates and executes the selected kernel.
         out = _launch(tuner, q, k, v)
@@ -96,7 +107,7 @@ def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
             chosen_kwargs = {'BLOCK_M': valid[0][0], 'BLOCK_N': valid[0][1]}
         report = {'shape': list(q.shape), 'device': str(q.device), 'dtype': str(q.dtype),
                   'reference_rows_checked': rows.tolist(), 'atol': atol, 'rtol': rtol,
-                  'candidates': candidates, 'selected': dict(chosen_kwargs) if chosen_kwargs else None,
+                  'candidates': candidate_reports, 'selected': dict(chosen_kwargs) if chosen_kwargs else None,
                   'calibration_seconds': time.monotonic() - started}
         _CACHE[key] = (tuner, report)
         print(f'autotune selected: {report["selected"]}; calibration={report["calibration_seconds"]:.3f}s', flush=True)
@@ -104,8 +115,8 @@ def autotuned_attention(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
     return _launch(_CACHE[key][0], q, k, v)
 
 
-def tuning_report(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01):
+def tuning_report(q, k, v, *, reference_rows=64, atol=0.002, rtol=0.01, candidates=None):
     """Return calibration metadata for this exact workload, or None."""
-    key = (_workload_key(q, k, v), int(reference_rows), float(atol), float(rtol))
+    key = (_workload_key(q, k, v), int(reference_rows), float(atol), float(rtol), _candidate_key(candidates))
     entry = _CACHE.get(key)
     return entry[1] if entry else None
