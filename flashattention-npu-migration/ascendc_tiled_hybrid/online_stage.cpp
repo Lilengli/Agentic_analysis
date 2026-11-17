@@ -3,10 +3,14 @@
 // CUDA reference: Dao-AILab/flash-attention flash_fwd_kernel.h, commit 9f9742c.
 // The two matrix multiplies are supplied by the caller, not fused into this kernel.
 #include <torch/extension.h>
+#include <cstdint>
 #include "kernel_operator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 constexpr int TILE = 128;
+// Each row has its own 64-byte scalar D-cache line. Distinct AIV cores must
+// never SetValue different elements in the same line.
+constexpr uint32_t STATE_STRIDE = 16;
 
 __global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
     GM_ADDR old_sum, GM_ADDR probs, GM_ADDR alpha, GM_ADDR new_max, GM_ADDR new_sum,
@@ -56,9 +60,10 @@ __global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
         }
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(p[static_cast<uint64_t>(r) * TILE], weights, TILE);
-        a.SetValue(r, correction);
-        nm.SetValue(r, m);
-        ns.SetValue(r, l);
+        const uint64_t state_offset = static_cast<uint64_t>(r) * STATE_STRIDE;
+        a.SetValue(state_offset, correction);
+        nm.SetValue(state_offset, m);
+        ns.SetValue(state_offset, l);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }
@@ -74,14 +79,21 @@ std::vector<at::Tensor> online_stage(const at::Tensor& scores, const at::Tensor&
     TORCH_CHECK(scores.dim() == 2 && scores.size(1) == TILE && rows_per_head > 0 && key_start >= 0 &&
         scores.size(0) % rows_per_head == 0 && old_max.numel() == scores.size(0) && old_sum.numel() == scores.size(0), "invalid shapes");
     auto probs = at::empty_like(scores);
-    auto alpha = at::empty_like(old_max);
-    auto new_max = at::empty_like(old_max);
-    auto new_sum = at::empty_like(old_sum);
+    // NPU allocations must be cache-line aligned so adjacent padded rows do
+    // not share a scalar cache line across cores.
+    auto alpha = at::empty({scores.size(0), STATE_STRIDE}, old_max.options());
+    auto new_max = at::empty_like(alpha);
+    auto new_sum = at::empty_like(alpha);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(alpha.data_ptr()) % 64 == 0 &&
+        reinterpret_cast<uintptr_t>(new_max.data_ptr()) % 64 == 0 &&
+        reinterpret_cast<uintptr_t>(new_sum.data_ptr()) % 64 == 0, "state buffers must be 64-byte aligned");
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     online_stage_kernel<<<24, nullptr, stream>>>(
         (uint8_t*)scores.data_ptr(), (uint8_t*)old_max.data_ptr(), (uint8_t*)old_sum.data_ptr(),
         (uint8_t*)probs.data_ptr(), (uint8_t*)alpha.data_ptr(), (uint8_t*)new_max.data_ptr(),
         (uint8_t*)new_sum.data_ptr(), scores.size(0), rows_per_head, key_start, scale);
-    return {probs, alpha, new_max, new_sum};
+    // Compact padded device state on the same stream for the next operation.
+    return {probs, alpha.select(1, 0).contiguous(), new_max.select(1, 0).contiguous(),
+            new_sum.select(1, 0).contiguous()};
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("online_stage", &online_stage); }
