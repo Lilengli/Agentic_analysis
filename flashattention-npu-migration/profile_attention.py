@@ -1,5 +1,6 @@
 """Capture one warmed-up attention call with Ascend AI Core counters."""
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -11,16 +12,24 @@ from flash_attention_ascend import kernel_function
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--impl', choices=('triton', 'sdpa'), required=True)
+    parser.add_argument('--impl', choices=('triton', 'sdpa', 'official'), required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--batch', type=int, default=1)
     parser.add_argument('--heads', type=int, default=2)
     parser.add_argument('--seq', type=int, default=128)
     parser.add_argument('--dim', type=int, default=128)
     parser.add_argument('--warmup', type=int, default=10)
+    parser.add_argument('--calls', type=int, default=1,
+                        help='number of consecutive calls captured by the profiler')
+    parser.add_argument('--block-m', type=int, default=32)
+    parser.add_argument('--block-n', type=int, default=32)
     args = parser.parse_args()
-    if min(args.batch, args.heads, args.seq, args.dim) < 1 or args.warmup < 1:
-        parser.error('shape and warmup values must be positive')
+    if min(args.batch, args.heads, args.seq, args.dim, args.warmup, args.calls,
+           args.block_m, args.block_n) < 1:
+        parser.error('shape, warmup, calls and block sizes must be positive')
+    if args.impl == 'official' and (args.dim not in (16, 32, 64, 128, 256)
+            or args.block_m < args.block_n or args.seq % args.block_m or args.seq % args.block_n):
+        parser.error('official requires supported dim, block-m >= block-n and seq divisible by both blocks')
     if not torch.npu.is_available():
         raise RuntimeError('No NPU is visible')
     output = Path(args.output).expanduser().resolve()
@@ -38,17 +47,22 @@ def main():
     def sdpa_call():
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
 
+    def official_call():
+        from official_fused_attention import attention
+        return attention(q, k, v, True, 1 / math.sqrt(args.dim), args.block_m, args.block_n)
+
     with torch.inference_mode():
-        actual, expected = triton_call(), sdpa_call()
+        run = {'triton': triton_call, 'sdpa': sdpa_call, 'official': official_call}[args.impl]
+        actual, expected = run(), sdpa_call()
         torch.npu.synchronize()
         max_err = (actual.float() - expected.float()).abs().max().item()
         passed = torch.allclose(actual, expected, atol=2e-2, rtol=2e-2)
         print(f'shape={shape} dtype=fp16 causal=True max_abs_error={max_err:.7g} match={passed}', flush=True)
         if not passed:
             raise SystemExit('Correctness check failed; profiling skipped')
-        run = triton_call if args.impl == 'triton' else sdpa_call
         for _ in range(args.warmup):
-            result = run()
+            for _ in range(args.calls):
+                result = run()
         torch.npu.synchronize()
 
         config = torch_npu.profiler._ExperimentalConfig(
