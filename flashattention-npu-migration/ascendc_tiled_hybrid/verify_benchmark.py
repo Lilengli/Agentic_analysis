@@ -16,6 +16,7 @@ p.add_argument('--warmup', type=int, default=1)
 p.add_argument('--repeat', type=int, default=3)
 p.add_argument('--output', default='tiled_hybrid_result.json')
 p.add_argument('--diagnose', action='store_true', help='check each stage; skip benchmarking')
+p.add_argument('--state-update', choices=('inplace', 'concat'), default='inplace')
 a = p.parse_args()
 if a.seq < 128 or a.seq % 128 or min(a.batch, a.heads, a.rows, a.repeat) < 1 or a.warmup < 0:
     p.error('seq must be a positive multiple of 128; batch, heads, rows and repeat must be positive')
@@ -24,7 +25,7 @@ shape = (a.batch, a.heads, a.seq, 128)
 q_cpu, k_cpu, v_cpu = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
 q, k, v = [x.to('npu:0') for x in (q_cpu, k_cpu, v_cpu)]
 with torch.inference_mode():
-    out = causal_attention(q, k, v, diagnose=a.diagnose)
+    out = causal_attention(q, k, v, diagnose=a.diagnose, state_update=a.state_update)
     torch.npu.synchronize()
     indices = torch.linspace(0, a.seq - 1, min(a.rows, a.seq)).long().unique()
     ref_scores = (q_cpu[:, :, indices, :].float() @ k_cpu.float().transpose(-1, -2)) / math.sqrt(128)
@@ -39,16 +40,17 @@ with torch.inference_mode():
     if a.diagnose:
         raise SystemExit('Per-block diagnosis and final reference check passed; no timing collected')
     for _ in range(a.warmup):
-        causal_attention(q, k, v)
+        causal_attention(q, k, v, state_update=a.state_update)
     torch.npu.synchronize()
     times = []
     for _ in range(a.repeat):
         torch.npu.synchronize()
         start = time.perf_counter()
-        causal_attention(q, k, v)
+        causal_attention(q, k, v, state_update=a.state_update)
         torch.npu.synchronize()
         times.append((time.perf_counter() - start) * 1000)
 result = {'shape': shape, 'correct': passed, 'rows_checked': indices.tolist(),
+          'state_update': a.state_update,
           'max_abs_error': error.max().item(), 'wall_ms': times,
           'note': 'synchronized full hybrid call; includes Python and multiple NPU kernels'}
 with open(a.output, 'w') as f:

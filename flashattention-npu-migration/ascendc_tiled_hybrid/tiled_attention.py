@@ -21,7 +21,11 @@ def _reference_stage(scores, old_max, old_sum, rows_per_head, start, scale):
     return p.to(scores.dtype), alpha, m, old_sum * alpha + p.sum(dim=1)
 
 
-def causal_attention(q, k, v, *, cpu_reference_stage=False, diagnose=False):
+def causal_attention(q, k, v, *, cpu_reference_stage=False, diagnose=False, state_update='inplace'):
+    if state_update not in ('inplace', 'concat'):
+        raise ValueError('state_update must be inplace or concat')
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
+        raise ValueError('this inference implementation does not implement backward')
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError('q/k/v must have matching B,H,S,D shapes')
     if q.dtype != torch.float16 or k.dtype != q.dtype or v.dtype != q.dtype:
@@ -72,9 +76,18 @@ def causal_attention(q, k, v, *, cpu_reference_stage=False, diagnose=False):
         alpha = alpha.view(b * h, rows, 1)
         # Cube path receives FP16 P and V; accumulation across tiles remains FP32.
         delta = torch.matmul(p, v[:, start:start + TILE, :]).float()
-        o = torch.cat((o[:, :start, :], o[:, start:, :] * alpha + delta), dim=1)
-        m = torch.cat((m[:, :start], new_m.view(b * h, rows)), dim=1)
-        l = torch.cat((l[:, :start], new_l.view(b * h, rows)), dim=1)
+        if state_update == 'inplace':
+            # Preserve finalized earlier queries; update only the active suffix.
+            # The producer/consumer ordering is maintained by TorchNPU's queue
+            # and the stream(true) drain at the next custom-stage launch.
+            o[:, start:, :].mul_(alpha).add_(delta)
+            m[:, start:].copy_(new_m.view(b * h, rows))
+            l[:, start:].copy_(new_l.view(b * h, rows))
+        else:
+            # Original implementation retained for an A/B comparison.
+            o = torch.cat((o[:, :start, :], o[:, start:, :] * alpha + delta), dim=1)
+            m = torch.cat((m[:, :start], new_m.view(b * h, rows)), dim=1)
+            l = torch.cat((l[:, :start], new_l.view(b * h, rows)), dim=1)
         if diagnose:
             check('PV delta', delta)
             check('accumulated output', o)
