@@ -23,6 +23,8 @@ def main():
                         help='number of consecutive calls captured by the profiler')
     parser.add_argument('--block-m', type=int, default=32)
     parser.add_argument('--block-n', type=int, default=32)
+    parser.add_argument('--metrics', choices=('pipe', 'memory'), default='pipe',
+                        help='collect pipeline activity or memory bandwidth counters')
     args = parser.parse_args()
     if min(args.batch, args.heads, args.seq, args.dim, args.warmup, args.calls,
            args.block_m, args.block_n) < 1:
@@ -66,7 +68,8 @@ def main():
 
         config = torch_npu.profiler._ExperimentalConfig(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            aic_metrics=(torch_npu.profiler.AiCMetrics.PipeUtilization if args.metrics == 'pipe'
+                         else torch_npu.profiler.AiCMetrics.Memory),
         )
         with torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.CPU,
