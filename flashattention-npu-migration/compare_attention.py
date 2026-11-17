@@ -24,9 +24,11 @@ def main():
     parser.add_argument('--block-n', type=int, default=32)
     parser.add_argument('--warmup', type=int, default=20)
     parser.add_argument('--repeats', type=int, default=100)
+    parser.add_argument('--reference-rows', type=int, default=32,
+                        help='query rows checked for sequences longer than 512')
     parser.add_argument('--output', default='attention_compare_results.json')
     a = parser.parse_args()
-    if min(a.seq, a.batch, a.heads, a.dim, a.block_m, a.block_n, a.warmup, a.repeats) < 1:
+    if min(a.seq, a.batch, a.heads, a.dim, a.block_m, a.block_n, a.warmup, a.repeats, a.reference_rows) < 1:
         parser.error('all numeric options must be positive')
     if a.dim not in (16, 32, 64, 128, 256):
         parser.error('official example requires dim in {16,32,64,128,256}')
@@ -47,10 +49,15 @@ def main():
     shape = (a.batch, a.heads, a.seq, a.dim)
     torch.manual_seed(1234)
     q_cpu, k_cpu, v_cpu = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
-    # CPU FP32 reference is outside the timed region, and shared by all paths.
-    scores = q_cpu.float() @ k_cpu.float().transpose(-2, -1) / math.sqrt(a.dim)
-    mask = torch.ones((a.seq, a.seq), dtype=torch.bool).triu(1)
+    # Check all rows at small lengths and evenly spaced rows at long lengths.
+    # Avoid allocating a full 16K x 16K CPU score matrix.
+    count = a.seq if a.seq <= 512 else min(a.seq, a.reference_rows)
+    indices = torch.linspace(0, a.seq - 1, count).round().long().unique()
+    scores = q_cpu.float().index_select(-2, indices) @ k_cpu.float().transpose(-2, -1) / math.sqrt(a.dim)
+    mask = torch.arange(a.seq)[None, :] > indices[:, None]
     reference = torch.softmax(scores.masked_fill(mask, float('-inf')), dim=-1) @ v_cpu.float()
+    result['reference'] = {'dtype': 'float32_cpu', 'query_rows_checked': indices.tolist(),
+                           'total_query_rows': a.seq, 'atol': 0.02, 'rtol': 0.02}
     q, k, v = [t.to('npu:0') for t in (q_cpu, k_cpu, v_cpu)]
     torch.npu.synchronize()
 
@@ -73,12 +80,13 @@ def main():
             try:
                 out = fn()
                 torch.npu.synchronize()
-                diff = (out.cpu().float() - reference).abs()
-                passed = torch.allclose(out.cpu().float(), reference, atol=0.02, rtol=0.02)
+                selected = out.cpu().float().index_select(-2, indices)
+                diff = (selected - reference).abs()
+                passed = torch.allclose(selected, reference, atol=0.02, rtol=0.02)
                 entry = {'status': 'correct' if passed else 'incorrect',
                          'max_abs_error_vs_fp32_cpu': diff.max().item()}
                 result['implementations'][name] = entry
-                print(f'{name}: {entry}', flush=True)
+                print(f'{name}: {entry}; checked {len(indices)}/{a.seq} query rows', flush=True)
                 if not passed:
                     continue
                 for _ in range(a.warmup):
