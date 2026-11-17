@@ -12,6 +12,14 @@ constexpr int TILE = 128;
 // never SetValue different elements in the same line.
 constexpr uint32_t STATE_STRIDE = 16;
 
+template <AscendC::HardEvent E>
+__aicore__ inline void sync_stage(AscendC::TPipe& pipe)
+{
+    int32_t event = static_cast<int32_t>(pipe.FetchEventID(E));
+    AscendC::SetFlag<E>(event);
+    AscendC::WaitFlag<E>(event);
+}
+
 __global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
     GM_ADDR old_sum, GM_ADDR probs, GM_ADDR alpha, GM_ADDR new_max, GM_ADDR new_sum,
     uint32_t rows, uint32_t rows_per_head, uint32_t key_start, float scale)
@@ -30,16 +38,36 @@ __global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
     pipe.InitBuffer(values_buf, TILE * sizeof(float));
     pipe.InitBuffer(weights_buf, TILE * sizeof(half));
     pipe.InitBuffer(exp_buf, 64 * sizeof(float));
+    AscendC::TBuf<AscendC::TPosition::VECCALC> input_buf, old_m_buf, old_l_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> alpha_buf, max_buf, sum_buf;
+    pipe.InitBuffer(input_buf, TILE * sizeof(half));
+    pipe.InitBuffer(old_m_buf, 8 * sizeof(float));
+    pipe.InitBuffer(old_l_buf, 8 * sizeof(float));
+    pipe.InitBuffer(alpha_buf, STATE_STRIDE * sizeof(float));
+    pipe.InitBuffer(max_buf, STATE_STRIDE * sizeof(float));
+    pipe.InitBuffer(sum_buf, STATE_STRIDE * sizeof(float));
+    auto input = input_buf.Get<half>();
+    auto old_m = old_m_buf.Get<float>();
+    auto old_l = old_l_buf.Get<float>();
+    auto alpha_out = alpha_buf.Get<float>();
+    auto max_out = max_buf.Get<float>();
+    auto sum_out = sum_buf.Get<float>();
     auto values = values_buf.Get<float>();
     auto weights = weights_buf.Get<half>();
     auto scratch = exp_buf.Get<float>();
     for (uint32_t r = AscendC::GetBlockIdx(); r < rows; r += AscendC::GetBlockNum()) {
         const uint32_t query_pos = key_start + r % rows_per_head;
-        float previous_max = om.GetValue(r);
+        // All GM reads use DMA: allocator reuse cannot leave stale scalar D-cache reads.
+        sync_stage<AscendC::HardEvent::S_MTE2>(pipe);
+        AscendC::DataCopy(input, s[static_cast<uint64_t>(r) * TILE], TILE);
+        AscendC::DataCopy(old_m, om[(r / 8) * 8], 8);
+        AscendC::DataCopy(old_l, os[(r / 8) * 8], 8);
+        sync_stage<AscendC::HardEvent::MTE2_S>(pipe);
+        float previous_max = old_m.GetValue(r % 8);
         float m = previous_max;
         for (uint32_t j = 0; j < TILE; ++j) {
             const float x = (key_start + j <= query_pos)
-                ? static_cast<float>(s.GetValue(static_cast<uint64_t>(r) * TILE + j)) * scale
+                ? static_cast<float>(input.GetValue(j)) * scale
                 : -3.402823466e+38F;
             values.SetValue(j, x);
             if (x > m) m = x;
@@ -47,24 +75,33 @@ __global__ __vector__ void online_stage_kernel(GM_ADDR scores, GM_ADDR old_max,
         for (uint32_t j = 0; j < TILE; ++j) values.SetValue(j, values.GetValue(j) - m);
         for (uint32_t j = 0; j < 64; ++j) scratch.SetValue(j, 0.0f);
         scratch.SetValue(0, previous_max - m);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        sync_stage<AscendC::HardEvent::S_V>(pipe);
         AscendC::Exp(values, values, TILE);
         AscendC::Exp(scratch, scratch, 64);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        sync_stage<AscendC::HardEvent::V_S>(pipe);
         const float correction = scratch.GetValue(0);
-        float l = os.GetValue(r) * correction;
+        float l = old_l.GetValue(r % 8) * correction;
         for (uint32_t j = 0; j < TILE; ++j) {
             const float x = values.GetValue(j);
             l += x;
             weights.SetValue(j, static_cast<half>(x));
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        for (uint32_t j = 0; j < STATE_STRIDE; ++j) {
+            alpha_out.SetValue(j, 0.0f);
+            max_out.SetValue(j, 0.0f);
+            sum_out.SetValue(j, 0.0f);
+        }
+        alpha_out.SetValue(0, correction);
+        max_out.SetValue(0, m);
+        sum_out.SetValue(0, l);
+        sync_stage<AscendC::HardEvent::S_MTE3>(pipe);
         AscendC::DataCopy(p[static_cast<uint64_t>(r) * TILE], weights, TILE);
         const uint64_t state_offset = static_cast<uint64_t>(r) * STATE_STRIDE;
-        a.SetValue(state_offset, correction);
-        nm.SetValue(state_offset, m);
-        ns.SetValue(state_offset, l);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::DataCopy(a[state_offset], alpha_out, STATE_STRIDE);
+        AscendC::DataCopy(nm[state_offset], max_out, STATE_STRIDE);
+        AscendC::DataCopy(ns[state_offset], sum_out, STATE_STRIDE);
+        // Complete outgoing transfers before the next row reuses UB buffers.
+        sync_stage<AscendC::HardEvent::MTE3_S>(pipe);
     }
 }
 
@@ -77,7 +114,7 @@ std::vector<at::Tensor> online_stage(const at::Tensor& scores, const at::Tensor&
         old_sum.scalar_type() == at::kFloat, "expected fp16 scores and fp32 state");
     TORCH_CHECK(scores.is_contiguous() && old_max.is_contiguous() && old_sum.is_contiguous(), "contiguous required");
     TORCH_CHECK(scores.dim() == 2 && scores.size(1) == TILE && rows_per_head > 0 && key_start >= 0 &&
-        scores.size(0) % rows_per_head == 0 && old_max.numel() == scores.size(0) && old_sum.numel() == scores.size(0), "invalid shapes");
+        scores.size(0) > 0 && scores.size(0) % 8 == 0 && scores.size(0) % rows_per_head == 0 && old_max.numel() == scores.size(0) && old_sum.numel() == scores.size(0), "invalid shapes");
     auto probs = at::empty_like(scores);
     // NPU allocations must be cache-line aligned so adjacent padded rows do
     // not share a scalar cache line across cores.

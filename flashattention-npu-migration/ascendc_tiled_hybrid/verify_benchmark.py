@@ -15,6 +15,7 @@ p.add_argument('--rows', type=int, default=64)
 p.add_argument('--warmup', type=int, default=1)
 p.add_argument('--repeat', type=int, default=3)
 p.add_argument('--output', default='tiled_hybrid_result.json')
+p.add_argument('--diagnose', action='store_true', help='check each stage; skip benchmarking')
 a = p.parse_args()
 if a.seq < 128 or a.seq % 128 or min(a.batch, a.heads, a.rows, a.repeat) < 1 or a.warmup < 0:
     p.error('seq must be a positive multiple of 128; batch, heads, rows and repeat must be positive')
@@ -23,7 +24,7 @@ shape = (a.batch, a.heads, a.seq, 128)
 q_cpu, k_cpu, v_cpu = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
 q, k, v = [x.to('npu:0') for x in (q_cpu, k_cpu, v_cpu)]
 with torch.inference_mode():
-    out = causal_attention(q, k, v)
+    out = causal_attention(q, k, v, diagnose=a.diagnose)
     torch.npu.synchronize()
     indices = torch.linspace(0, a.seq - 1, min(a.rows, a.seq)).long().unique()
     ref_scores = (q_cpu[:, :, indices, :].float() @ k_cpu.float().transpose(-1, -2)) / math.sqrt(128)
@@ -35,6 +36,8 @@ with torch.inference_mode():
     print(f'shape={shape} rows={len(indices)} correct={passed} max_abs={error.max().item():.8g}', flush=True)
     if not passed:
         raise SystemExit('Accuracy check failed; performance comparison aborted')
+    if a.diagnose:
+        raise SystemExit('Per-block diagnosis and final reference check passed; no timing collected')
     for _ in range(a.warmup):
         causal_attention(q, k, v)
     torch.npu.synchronize()

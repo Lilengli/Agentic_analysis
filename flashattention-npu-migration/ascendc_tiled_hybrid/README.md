@@ -37,3 +37,11 @@ temporary and launches multiple operators per tile. The output timing is a
 synchronized complete-call wall time, not a single-kernel time. If compilation
 or correctness fails, do not compare performance. `test_numpy.py` only checks
 the recurrence and tile/mask indexing on CPU; it does not test Ascend C.
+
+For first-divergence reporting, use `python verify_benchmark.py --seq 16384
+--diagnose`. It checks each tile against a framework reference and skips timing.
+The updated device stage transfers both inputs and padded state outputs through
+UB/DMA rather than scalar GM cache accesses. Explicit hardware events order
+MTE2, Scalar, Vector, and MTE3, including completion before UB buffer reuse.
+These changes address memory visibility/synchronization defects; target NPU
+testing is still required before claiming correctness.

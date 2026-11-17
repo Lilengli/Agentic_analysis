@@ -21,7 +21,7 @@ def _reference_stage(scores, old_max, old_sum, rows_per_head, start, scale):
     return p.to(scores.dtype), alpha, m, old_sum * alpha + p.sum(dim=1)
 
 
-def causal_attention(q, k, v, *, cpu_reference_stage=False):
+def causal_attention(q, k, v, *, cpu_reference_stage=False, diagnose=False):
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError('q/k/v must have matching B,H,S,D shapes')
     if q.dtype != torch.float16 or k.dtype != q.dtype or v.dtype != q.dtype:
@@ -48,8 +48,26 @@ def causal_attention(q, k, v, *, cpu_reference_stage=False):
         rows = seq - start
         # Score and probability tiles are O(B*H*S*TILE), never O(S*S).
         scores = torch.matmul(q[:, start:, :], k[:, start:start + TILE, :].transpose(-1, -2)).contiguous()
-        p, alpha, new_m, new_l = stage(scores.view(-1, TILE), m[:, start:].contiguous().view(-1),
-                                       l[:, start:].contiguous().view(-1), rows, start, 1.0 / math.sqrt(d))
+        old_m = m[:, start:].contiguous().view(-1)
+        old_l = l[:, start:].contiguous().view(-1)
+        def check(name, x):
+            if not torch.isfinite(x).all().item():
+                raise RuntimeError(f'first nonfinite: key_start={start} tensor={name}')
+        if diagnose:
+            check('scores', scores)
+            check('old_max', old_m)
+            check('old_sum', old_l)
+        p, alpha, new_m, new_l = stage(scores.view(-1, TILE), old_m, old_l,
+                                       rows, start, 1.0 / math.sqrt(d))
+        if diagnose:
+            ref = _reference_stage(scores.view(-1, TILE), old_m, old_l, rows, start, 1.0 / math.sqrt(d))
+            for name, got, expected in zip(('p', 'alpha', 'new_max', 'new_sum'), (p, alpha, new_m, new_l), ref):
+                check(name, got)
+                if not torch.allclose(got, expected, atol=0.002, rtol=0.01):
+                    err = (got.float() - expected.float()).abs().max().item()
+                    raise RuntimeError(f'first divergence: key_start={start} tensor={name} max_abs={err}')
+            if (new_l <= 0).any().item():
+                raise RuntimeError(f'nonpositive denominator: key_start={start}')
         p = p.view(b * h, rows, TILE)
         alpha = alpha.view(b * h, rows, 1)
         # Cube path receives FP16 P and V; accumulation across tiles remains FP32.
@@ -57,4 +75,9 @@ def causal_attention(q, k, v, *, cpu_reference_stage=False):
         o = torch.cat((o[:, :start, :], o[:, start:, :] * alpha + delta), dim=1)
         m = torch.cat((m[:, :start], new_m.view(b * h, rows)), dim=1)
         l = torch.cat((l[:, :start], new_l.view(b * h, rows)), dim=1)
+        if diagnose:
+            check('PV delta', delta)
+            check('accumulated output', o)
+            if start % 2048 == 0:
+                print(f'block checks passed: key_start={start}', flush=True)
     return (o / l.unsqueeze(-1)).to(q.dtype).view(b, h, seq, d)
