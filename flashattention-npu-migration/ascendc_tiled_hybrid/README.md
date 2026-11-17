@@ -45,3 +45,10 @@ UB/DMA rather than scalar GM cache accesses. Explicit hardware events order
 MTE2, Scalar, Vector, and MTE3, including completion before UB buffer reuse.
 These changes address memory visibility/synchronization defects; target NPU
 testing is still required before claiming correctness.
+
+The direct host launch now uses `stream(true)` to drain TorchNPU's host task
+queue before submitting the raw kernel. `stream(false)` with an unqueued raw
+launch could overtake queued QK/state producers; per-block diagnostics hid
+that ordering bug by synchronizing before the stage. Queue draining adds host
+overhead; future asynchronous integration should use OpCommand::RunOpApiV2
+instead of removing the drain from a direct launch.

@@ -124,7 +124,10 @@ std::vector<at::Tensor> online_stage(const at::Tensor& scores, const at::Tensor&
     TORCH_CHECK(reinterpret_cast<uintptr_t>(alpha.data_ptr()) % 64 == 0 &&
         reinterpret_cast<uintptr_t>(new_max.data_ptr()) % 64 == 0 &&
         reinterpret_cast<uintptr_t>(new_sum.data_ptr()) % 64 == 0, "state buffers must be 64-byte aligned");
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // This direct launch bypasses TorchNPU's OpCommand task queue. Drain queued
+    // host submissions first so QK/state producers reach the ACL stream before
+    // our consumer kernel. stream(false) is safe only with queued launch integration.
+    auto stream = c10_npu::getCurrentNPUStream().stream(true);
     online_stage_kernel<<<24, nullptr, stream>>>(
         (uint8_t*)scores.data_ptr(), (uint8_t*)old_max.data_ptr(), (uint8_t*)old_sum.data_ptr(),
         (uint8_t*)probs.data_ptr(), (uint8_t*)alpha.data_ptr(), (uint8_t*)new_max.data_ptr(),
