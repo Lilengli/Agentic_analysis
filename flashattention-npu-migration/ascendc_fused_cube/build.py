@@ -45,7 +45,7 @@ compile_cmd = ['bisheng', '-O2', '-x', 'asc', '--npu-arch=dav-2201',
                f'-D_GLIBCXX_USE_CXX11_ABI={abi}', '-DTORCH_EXTENSION_NAME=fused_cube_ext', '-DCATLASS_ARCH=2201', '-DK_MAX_SHAPE_DIM=0']
 compile_cmd += [f'-I{p}' for p in includes] + ['-c', str(root/'fused_attention.cpp'), '-o', str(obj)]
 link_cmd = ['bisheng', '--npu-arch=dav-2201', '-shared', '-fPIC', str(obj)]
-link_cmd += [f'-L{p}' for p in libs] + ['-ltorch_python', '-ltorch', '-ltorch_cpu', '-lc10', '-ltorch_npu', '-lascendcl', '-lruntime', '-o', str(so)]
+link_cmd += [f'-L{p}' for p in libs] + ['-ltorch_python', '-ltorch', '-ltorch_cpu', '-lc10', '-ltorch_npu', '-lascendcl', '-o', str(so)]
 for cmd in (compile_cmd, link_cmd):
     print('+', ' '.join(shlex.quote(str(x)) for x in cmd), flush=True)
     subprocess.run([str(x) for x in cmd], check=True)

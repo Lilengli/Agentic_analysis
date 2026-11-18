@@ -2,7 +2,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <limits>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "runtime/rt_ffts.h"
+#include "acl/acl.h"
 #include "mixed_kernel.hpp"
 
 at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
@@ -25,9 +25,10 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     // lifetime is safe because raw launch is submitted before tensor release.
     auto relay=at::empty({groups*per_group},q.options().dtype(at::kByte));
     auto stream=c10_npu::getCurrentNPUStream().stream(true);
-    uint64_t sync_base=0; uint32_t sync_length=0;
-    const auto error=rtGetC2cCtrlAddr(&sync_base,&sync_length);
-    TORCH_CHECK(error==RT_ERROR_NONE && sync_base!=0,"rtGetC2cCtrlAddr failed: ",error);
+    void* sync_ptr=nullptr;
+    const auto error=aclrtGetHardwareSyncAddr(&sync_ptr);
+    TORCH_CHECK(error==ACL_SUCCESS && sync_ptr!=nullptr,"aclrtGetHardwareSyncAddr failed: ",error);
+    const uint64_t sync_base=reinterpret_cast<uint64_t>(sync_ptr);
     auto qp=static_cast<uint8_t*>(q.data_ptr()); auto kp=static_cast<uint8_t*>(k.data_ptr());
     auto vp=static_cast<uint8_t*>(v.data_ptr()); auto op=static_cast<uint8_t*>(out.data_ptr());
     auto wp=static_cast<uint8_t*>(relay.data_ptr()); const uint32_t seq=q.size(2);
