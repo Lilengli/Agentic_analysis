@@ -1,0 +1,92 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "compute_capability": [
+    9,
+    0
+  ],
+  "torch_version": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "flash_attn_version": "2.8.3.post2",
+  "flash_attn_path": "/inspire/hdd/global_user/260108540217/qwen/torch-env/lib/python3.12/site-packages/flash_attn/__init__.py",
+  "causal": true,
+  "dropout_p": 0.0,
+  "seed": 1234,
+  "tensors": [
+    {
+      "name": "Q",
+      "shape": [
+        1,
+        16384,
+        2,
+        128
+      ],
+      "stride": [
+        4194304,
+        256,
+        128,
+        1
+      ],
+      "dtype": "torch.float16",
+      "start": "0x7f3802000000",
+      "end": "0x7f3802800000",
+      "bytes": 8388608
+    },
+    {
+      "name": "K",
+      "shape": [
+        1,
+        16384,
+        2,
+        128
+      ],
+      "stride": [
+        4194304,
+        256,
+        128,
+        1
+      ],
+      "dtype": "torch.float16",
+      "start": "0x7f3802800000",
+      "end": "0x7f3803000000",
+      "bytes": 8388608
+    },
+    {
+      "name": "V",
+      "shape": [
+        1,
+        16384,
+        2,
+        128
+      ],
+      "stride": [
+        4194304,
+        256,
+        128,
+        1
+      ],
+      "dtype": "torch.float16",
+      "start": "0x7f37ce200000",
+      "end": "0x7f37cea00000",
+      "bytes": 8388608
+    },
+    {
+      "name": "O",
+      "shape": [
+        1,
+        16384,
+        2,
+        128
+      ],
+      "stride": [
+        4194304,
+        256,
+        128,
+        1
+      ],
+      "dtype": "torch.float16",
+      "start": "0x7f37cea00000",
+      "end": "0x7f37cf200000",
+      "bytes": 8388608
+    }
+  ]
+}
