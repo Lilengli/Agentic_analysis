@@ -222,6 +222,7 @@ int main(int argc, char** argv) {
         CheckShape<32, 128>();
         CheckShape<64, 64>();
         CheckShape<64, 128>();
+        CheckShape<128, 128>();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

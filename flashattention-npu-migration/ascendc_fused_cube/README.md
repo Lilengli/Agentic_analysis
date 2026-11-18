@@ -113,3 +113,27 @@ The CUDA algorithm reference remains Dao-AILab/flash-attention
 `flash_fwd_kernel.h` at `9f9742c80e69b3ca28a231c26ef931e98c2c3826`.
 Hardware primitives are from pinned CATLASS revision
 `769cd40a8716b28650b6bebb08db4834eea4462f`; see `third_party/NOTICE.md` and license.
+
+### Experimental BM128 traffic reduction
+
+`--block-m 128 --block-n 128` reuses each K/V tile across twice as many query
+rows as the original 64x128 configuration. The online softmax and FP32 relay
+are unchanged. `traffic_model.py` predicts source-level logical GM bytes, not
+physical HBM traffic. For S=16384, batch*heads=2 it predicts 7240 MiB total for
+64x128 and 6208 MiB for 128x128 (14.25% less). These are not measured results.
+
+The 128x128 shape requires CANN compilation and independent device correctness
+and performance validation. The default remains 64x128. Each AIV uses about
+132864 bytes of UB and AIC uses 64 KiB of L0C. CPU simulation cannot validate
+device lowering, hardware buffer limits, event synchronization or performance.
+
+```
+python build.py
+python run.py --seq 16384 --heads 2 --block-m 64 --block-n 128 --seeds 1234 4321 --rows 64 --warmup 3 --repeat 5 --profile ./profile_bm64_memory --profile-metrics memory-access --output result_bm64.json
+python run.py --seq 16384 --heads 2 --block-m 128 --block-n 128 --seeds 1234 4321 --rows 64 --warmup 3 --repeat 5 --profile ./profile_bm128_memory --profile-metrics memory-access --output result_bm128.json
+```
+
+`kernel_metrics` in each result JSON contains the profiler's original fields;
+compare `*_GM_to_L1_datas`, `*_L0C_to_GM_datas`, `*_GM_to_UB_datas` and
+`*_UB_to_GM_datas` alongside the time. A run must pass all verification checks.
+MemoryAccess availability and collected fields depend on torch_npu and CANN.

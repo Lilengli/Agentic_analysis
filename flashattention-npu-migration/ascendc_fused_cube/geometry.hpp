@@ -4,7 +4,7 @@
 namespace CubeFA {
 constexpr uint32_t D=128;
 template<uint32_t BM,uint32_t BN> struct Geometry {
-    static_assert((BM==32 || BM==64) && (BN==64 || BN==128) && BM<=BN);
+    static_assert((BM==32 || BM==64 || BM==128) && (BN==64 || BN==128) && BM<=BN);
     static constexpr uint32_t Rows=BM/2;
     static constexpr uint32_t SBytes=BM*BN*4;
     static constexpr uint32_t PBytes=BM*BN*2;

@@ -19,7 +19,7 @@ def main():
     p.add_argument('--seq', type=int, default=16384)
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--heads', type=int, default=2)
-    p.add_argument('--block-m', type=int, choices=(32, 64), default=64)
+    p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
     p.add_argument('--block-n', type=int, choices=(64, 128), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
     p.add_argument('--rows', type=int, default=64)
@@ -28,10 +28,11 @@ def main():
     p.add_argument('--repeat', type=int, default=3)
     p.add_argument('--verify-only', action='store_true')
     p.add_argument('--profile', help='new output directory for one-call NPU profile')
+    p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
     a = p.parse_args()
     if not (0 < a.seq <= 16384 and a.seq % a.block_n == 0 and 0 < a.blocks <= 24
-            and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
+            and a.block_m <= a.block_n and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: require 0<S<=16384 divisible by BN, groups 1..24, positive counts')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
@@ -101,9 +102,15 @@ def main():
                 verify(out, f'timed_call={i}')
         profile = None
         if a.profile:
+            if a.profile_metrics == 'memory-access':
+                metrics = getattr(torch_npu.profiler.AiCMetrics, 'MemoryAccess', None)
+                if metrics is None:
+                    raise RuntimeError('torch_npu.profiler.AiCMetrics.MemoryAccess is unavailable')
+            else:
+                metrics = torch_npu.profiler.AiCMetrics.PipeUtilization
             config = torch_npu.profiler._ExperimentalConfig(
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                aic_metrics=metrics,
             )
             with torch_npu.profiler.profile(
                 activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
@@ -132,9 +139,10 @@ def main():
                 try: return float(row.get(key,'0').strip())
                 except (ValueError,AttributeError): return 0.0
             profile['cube_activity_verified']=any(number(row,'aic_mac_time(us)')>0 or number(row,'aic_mac_ratio')>0 or number(row,'cube_utilization(%)')>0 for row in kernel_rows)
+            profile['metric_set'] = a.profile_metrics
             profile['kernel_metrics']=kernel_rows
             print('profile:', profile, flush=True)
-            if not profile['cube_activity_verified']:
+            if a.profile_metrics == 'pipe' and not profile['cube_activity_verified']:
                 print('WARNING: positive AIC MAC/cycle activity was not confirmed; inspect profiler support/CSV.',flush=True)
             if not profile['one_task_verified']:
                 print('WARNING: one fused task was not confirmed; inspect exported symbols/trace.', flush=True)
