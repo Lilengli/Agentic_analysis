@@ -17,7 +17,8 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
 
 template <uint32_t BM, uint32_t BN>
 struct UbLayout {
-    static constexpr uint32_t bytes = 2 * BM * D * sizeof(half) + 2 * BM * D * sizeof(float)
+    static constexpr uint32_t bytes =
+        2 * BM * D * sizeof(half) + 2 * BM * D * sizeof(float)
         + 2 * BN * D * sizeof(half) + 3 * BN * D * sizeof(float)
         + (2 * BN + BN + BN * 8 + 2 * BM) * sizeof(float);
 };
