@@ -1,0 +1,14 @@
+{
+  "akg_commit": "5aa15f3fe4d856eb60cd3b27447e04f5f1fb4dff",
+  "stages": [
+    "AKG KernelDesigner",
+    "AKG KernelGen"
+  ],
+  "model": "gpt-6-luna",
+  "target_arch": "ascend910b4 (assumption; confirm actual model)",
+  "verified": false,
+  "verification": "not run; no local Ascend device",
+  "sha256": "6e512b18b14737a1cf0b75027a2ae804220bb9e42d669e58c58161537c5f4791",
+  "generation": "completed",
+  "llm_calls": 3
+}

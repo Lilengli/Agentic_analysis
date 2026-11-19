@@ -1,0 +1,79 @@
+sketch causal_attention_16k {
+  symbols: B, N, S, D;
+  tensors: Q[B, N, S, D]: f16;
+           K[B, N, S, D]: f16;
+           V[B, N, S, D]: f16;
+           O[B, N, S, D]: f16;
+  constexpr: m0, n0, d0;
+  m0, n0, d0 = 64, 128, 128;
+
+  scale = 1.0 / sqrt(D);
+
+  # 每个 query tile 独立计算；在 AI Core 间分发，避免生成 S×S 中间张量。
+  @llm_hint("parallel", "coreidx")
+  for b in range(0, B):
+    for h in range(0, N):
+      for q_start in range(0, S, m0):
+        q_tile = alloc([m0, d0], llm_hint=["fast", "input_cache"]);
+        load(Q[b, h, q_start:q_start+m0, 0:D] -> q_tile);
+
+        # FP32 在线 softmax 状态和输出累加器。
+        row_max = alloc([m0], llm_hint=["fastest", "accumulator"]);
+        row_sum = alloc([m0], llm_hint=["fastest", "accumulator", "init_zero"]);
+        out_acc = alloc([m0, d0], llm_hint=["fastest", "accumulator", "init_zero"]);
+        fill(row_max, -inf);
+
+        scores = alloc([m0, n0], llm_hint=["fast", "temp_workspace"]);
+        probs = alloc([m0, n0], llm_hint=["fast", "temp_workspace"]);
+        probs_f16 = alloc([m0, n0], llm_hint=["fast", "temp_workspace"]);
+        k_tile = alloc([n0, d0], llm_hint=["fast", "input_cache"]);
+        v_tile = alloc([n0, d0], llm_hint=["fast", "input_cache"]);
+        out_partial = alloc([m0, d0], llm_hint=["fastest", "accumulator", "init_zero"]);
+
+        # 只遍历可能影响当前 query tile 的 key tile。
+        # Kᵀ 为 [D, n0]；矩阵乘累加使用 FP32，tile 尺寸满足 L0A/L0B/L0C 容量约束。
+        @llm_hint("pipeline")
+        for k_start in range(0, ceil(min(S, q_start + m0), n0)):
+          load(K[b, h, k_start:k_start+n0, 0:D] -> k_tile);
+          load(V[b, h, k_start:k_start+n0, 0:D] -> v_tile);
+
+          gemm(q_tile, transpose(k_tile), dst=scores);
+          mul(scores, scale, scores);
+
+          # 对每个 query 行屏蔽 key_position > query_position 的分数。
+          causal_mask(scores,
+                      query_positions=q_start:q_start+m0,
+                      key_positions=k_start:k_start+n0,
+                      keep=(key_position <= query_position),
+                      fill=-inf);
+
+          tile_max = alloc([m0], llm_hint=["fastest", "temp_workspace"]);
+          reduce_max(scores, axis=1, dst=tile_max);
+
+          next_max = alloc([m0], llm_hint=["fastest", "temp_workspace"]);
+          max(row_max, tile_max, next_max);
+
+          alpha = alloc([m0], llm_hint=["fastest", "temp_workspace"]);
+          sub(row_max, next_max, alpha);
+          exp(alpha, alpha);
+
+          sub(scores, next_max[:, None], probs);
+          exp(probs, probs);
+
+          tile_sum = alloc([m0], llm_hint=["fastest", "temp_workspace"]);
+          reduce_sum(probs, axis=1, dst=tile_sum);
+          mul(alpha, row_sum, row_sum);
+          add(row_sum, tile_sum, row_sum);
+
+          # 概率转 FP16 供 CUBE 执行 P×V；累加器保持 FP32。
+          cast(probs, dtype=f16, dst=probs_f16);
+          gemm(probs_f16, v_tile, dst=out_partial);
+
+          mul(out_acc, alpha[:, None], out_acc);
+          add(out_acc, out_partial, out_acc);
+          copy(next_max, row_max);
+
+        div(out_acc, row_sum[:, None], out_acc);
+        cast(out_acc, dtype=f16, dst=out_acc);
+        store(out_acc -> O[b, h, q_start:q_start+m0, 0:D]);
+}
