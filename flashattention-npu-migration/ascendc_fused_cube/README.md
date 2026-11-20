@@ -23,8 +23,10 @@ implementation when a check fails.
    performs causal masking and online softmax. AIC can issue two further QKs
    before waiting for the current tile's probabilities.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
-   row max and sum use vector reduction APIs. Only the diagonal tile needs
-   masked vector fills. Exponentiated weights are cast to FP16 and sent to
+   row max and sum use vector reduction APIs. Before processing query tiles,
+   each AIV builds packed causal masks in UB for each query alignment. The
+   diagonal tile applies its mask with one Tensor–Scalar Select call.
+   Exponentiated weights are cast to FP16 and sent to
    the relay; FP32 denominators use the weights before this cast.
 4. AIC waits for both halves and computes `P @ V` using Cube, with FP32 output
    through Fixpipe. Both AIVs DMA-load their result rows and update accumulated
@@ -37,8 +39,8 @@ Default BM64/BN128 uses 144 KiB of relay per group, or **3.375 MiB for 24 groups
 independent of sequence length. BM32/BN64 uses 44 KiB per group and BM128/BN128
 uses 288 KiB. The extra score slots increase workspace capacity without
 adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
-64/16/32/64 KiB, respectively; source UB allocation per AIV is 82,816 bytes,
-excluding compiler overhead/spills.
+64/16/32/64 KiB, respectively. Source UB allocation per AIV is 83,840 bytes.
+The UB budget also leaves 8 KiB for Select's internal workspace.
 
 The three score slots have separate ready flags, QK_READY, QK_NEXT_READY and
 QK_THIRD_READY (FIX). P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) are shared across
@@ -137,7 +139,8 @@ physical HBM traffic. For S=16384, batch*heads=2 it predicts 7240 MiB total for
 
 The 128x128 shape requires CANN compilation and independent device correctness
 and performance validation. The default remains 64x128. Each AIV uses about
-165632 bytes of UB and AIC uses two 64 KiB L0C slots. CPU simulation cannot validate
+166656 bytes of explicit UB plus the 8 KiB Select workspace, and each AIC uses
+two 64 KiB L0C slots. CPU simulation cannot validate
 device lowering, hardware buffer limits, event synchronization or performance.
 
 ```

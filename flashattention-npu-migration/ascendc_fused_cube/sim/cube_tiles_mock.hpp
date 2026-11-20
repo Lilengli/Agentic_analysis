@@ -99,6 +99,7 @@ struct Stats {
     uint64_t exp_calls = 0;
     uint64_t cast_calls = 0;
     uint64_t duplicate_calls = 0;
+    uint64_t select_calls = 0;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
     std::vector<PvWaitSnapshot> pv_waits;
     std::array<size_t, 5> local_bytes_by_position{};
@@ -250,6 +251,7 @@ enum { AIC = 0, AIV = 1 };
 enum class TPosition { A1 = 0, A2 = 1, B2 = 2, CO1 = 3, VECCALC = 4 };
 enum class RoundMode { CAST_NONE, CAST_RINT };
 enum class ReduceOrder { ORDER_ONLY_VALUE };
+enum class SELMODE { VSEL_TENSOR_SCALAR_MODE };
 enum class HardEvent { V_MTE2, MTE2_V, V_S, S_V, V_MTE3, MTE3_V, FIX_M };
 
 inline uint32_t GetBlockIdx() { return CubeFASim::context.group * 3; }
@@ -353,19 +355,16 @@ template <class T> void Duplicate(LocalTensor<T> destination, T value, size_t n)
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, value);
     CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
 }
-inline void Duplicate(LocalTensor<float> destination, float value, const uint64_t mask[],
-        uint8_t repeats, uint16_t block_stride, uint8_t repeat_stride) {
-    constexpr size_t block_elements = 32 / sizeof(float);
-    if (destination.offset % 32 || !mask[0] || mask[1] || !repeats)
-        throw std::runtime_error("mixed simulator: invalid masked FP32 Duplicate");
-    for (size_t repeat = 0; repeat < repeats; ++repeat) {
-        for (size_t lane = 0; lane < 64; ++lane) {
-            if (!(mask[0] & (uint64_t{1} << lane))) continue;
-            const size_t block = repeat * repeat_stride + lane / block_elements * block_stride;
-            destination.SetValue(block * block_elements + lane % block_elements, value);
-        }
+inline void Select(LocalTensor<float> destination, LocalTensor<uint32_t> mask,
+        LocalTensor<float> source, float other, SELMODE, size_t n) {
+    if (destination.offset % 32 || source.offset % 32 || mask.offset % 32 ||
+            n > destination.length || n > source.length || (n + 31) / 32 > mask.length)
+        throw std::runtime_error("mixed simulator: invalid packed-mask Select operands");
+    for (size_t i = 0; i < n; ++i) {
+        const bool keep = (mask.GetValue(i / 32) >> (i % 32)) & 1;
+        destination.SetValue(i, keep ? source.GetValue(i) : other);
     }
-    CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
+    CubeFASim::CountVector(&CubeFASim::Stats::select_calls);
 }
 
 template <class T> void WholeReduceMax(LocalTensor<T> destination, LocalTensor<T> source,

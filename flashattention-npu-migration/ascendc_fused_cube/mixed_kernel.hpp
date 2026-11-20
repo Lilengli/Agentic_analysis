@@ -8,39 +8,29 @@
 #endif
 
 namespace CubeFA {
-template<uint32_t Rows, uint32_t Cols>
-__aicore__ inline void MaskFutureScores(AscendC::LocalTensor<float> scores, uint32_t first_visible)
+template<uint32_t BM,uint32_t BN>
+__aicore__ inline void InitCausalMasks(AscendC::LocalTensor<uint32_t> masks, uint32_t sub)
 {
-    constexpr uint32_t lanes = 64;  // One 256-byte FP32 vector repeat.
-    constexpr uint8_t row_stride = Cols * sizeof(float) / 32;  // In datablocks.
-    constexpr uint64_t all_lanes = ~uint64_t{0};
-    constexpr float blocked_score = -3.402823466e+38F;
-
-    if constexpr (Cols == 2 * lanes) {
-        if (first_visible <= lanes) {
-            const uint32_t full = lanes + 1 - first_visible;
-            const uint8_t repeats = static_cast<uint8_t>(full < Rows ? full : Rows);
-            // In these rows, all of the second 64-column segment is masked.
-            uint64_t mask[2] = {all_lanes, 0};
-            AscendC::Duplicate(scores[lanes], blocked_score, mask, repeats, 1, row_stride);
+    using G=Geometry<BM,BN>;
+    constexpr uint32_t WordsPerRow=BN/32;
+    for (uint32_t stripe=0;stripe<BN/BM;++stripe) {
+        for (uint32_t row=0;row<G::Rows;++row) {
+            const uint32_t visible=stripe*BM+sub*G::Rows+row+1;
+            const uint32_t offset=stripe*G::CausalMaskWords+row*WordsPerRow;
+            for (uint32_t word=0;word<WordsPerRow;++word) {
+                const uint32_t column=word*32;
+                const uint32_t count=visible>column ? visible-column : 0;
+                const uint32_t bits=count>=32 ? ~uint32_t{0} : (uint32_t{1}<<count)-1;
+                masks.SetValue(offset+word,bits);
+            }
         }
-    }
-
-    for (uint32_t row = 0; row < Rows && first_visible + row < Cols; ++row) {
-        const uint32_t visible = first_visible + row;
-        const uint32_t lane = visible % lanes;
-        if (lane == 0) continue;  // The fully masked segment was filled above.
-        // Keep the segment base aligned and preserve its visible prefix.
-        uint64_t mask[2] = {all_lanes << lane, 0};
-        const uint32_t segment_base = visible - lane;
-        AscendC::Duplicate(scores[row * Cols + segment_base], blocked_score, mask, 1, 1, row_stride);
     }
 }
 
-template<uint32_t Rows,uint32_t BN>
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
-    AscendC::LocalTensor<float> maxB, uint32_t gm_slot, uint32_t first_visible)
+    AscendC::LocalTensor<float> maxB, uint32_t gm_slot, AscendC::LocalTensor<uint32_t> causal_mask)
 {
     if (gm_slot==0) AscendC::CrossCoreWaitFlag(QK_READY);
     else if (gm_slot==1) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
@@ -51,8 +41,9 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
     AscendC::Muls(s,s,0.08838834764831845f,Rows*BN);
     AscendC::PipeBarrier<PIPE_V>();
-    if (first_visible<BN) {
-        MaskFutureScores<Rows,BN>(s,first_visible);
+    if constexpr (ApplyCausalMask) {
+        AscendC::Select(s,causal_mask,s,-3.402823466e+38F,
+            AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,Rows*BN);
         AscendC::PipeBarrier<PIPE_V>();
     }
     AscendC::WholeReduceMax(maxA,s,64,Rows,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
@@ -141,18 +132,23 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     } else {
         constexpr uint32_t R=G::Rows;
         constexpr uint32_t ScoreElements=R*BN;
-        static_assert(G::UbBytes<=192*1024-256);
-        AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB;
+        static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
+        AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float)); pipe.InitBuffer(pB,R*BN*2);
         pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);
+        pipe.InitBuffer(maskB,G::CausalMaskBytes);
         auto score_ub=sB.template Get<float>(); auto p=pB.template Get<half>();
         auto delta=dB.template Get<float>(); auto out=oB.template Get<float>(); auto oh=ohB.template Get<half>();
         auto m=mB.template Get<float>(); auto l=lB.template Get<float>(); auto alpha=alphaB.template Get<float>();
         auto maxA=maxAB.template Get<float>(); auto maxB=maxBB.template Get<float>();
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
+        auto masks=maskB.template Get<uint32_t>();
+        // Each alignment repeats across sequence blocks and heads.
+        InitCausalMasks<BM,BN>(masks,sub);
+        Sync<AscendC::HardEvent::S_V>(pipe);
         for(uint32_t task=group;task<tasks;task+=groups) {
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
@@ -164,8 +160,9 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             uint32_t gm_slot=0, ub_slot=0;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
-            PrepareScoreTile<R,BN>(score_ub,sgm[score_row_offset],maxA,maxB,gm_slot,
-                qs+sub*R-uint32_t(first_key)+1);
+            const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
+            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,gm_slot,
+                masks[mask_offset]);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
                 auto s=score_ub[ub_slot*ScoreElements];
                 Sync<AscendC::HardEvent::V_S>(pipe);
@@ -197,8 +194,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
                     // QK for the next tile is issued before AIC waits for this P_READY.
                     // Only score-local math runs here, so alpha remains valid for this PV.
-                    PrepareScoreTile<R,BN>(score_ub[(ub_slot^1)*ScoreElements],
-                        sgm[next_score_offset+score_row_offset],maxA,maxB,gm_slot,BN);
+                    PrepareScoreTile<R,BN,false>(score_ub[(ub_slot^1)*ScoreElements],
+                        sgm[next_score_offset+score_row_offset],maxA,maxB,gm_slot,masks);
                 }
                 AscendC::CrossCoreWaitFlag(PV_READY);
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);
