@@ -25,8 +25,8 @@ implementation when a check fails.
    QK writes can queue ahead of the first PV.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
    row maxima use two levels of BlockReduceMax per 64-column segment. Row
-   sums use WholeReduceSum. The host caches packed causal
-   masks in GM by device and tile shape. Each active AIV loads its mask
+   sums use two levels of BlockReduceSum per 64-column segment. The host caches
+   packed causal masks in GM by device and tile shape. Each active AIV loads its mask
    table into UB once before waiting for the first QK tile. The
    diagonal tile applies its mask with one Tensor–Scalar Select call. Each
    AIV updates the running row maxima and alpha exponents with vector

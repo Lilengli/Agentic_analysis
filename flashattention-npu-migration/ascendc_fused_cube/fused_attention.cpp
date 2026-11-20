@@ -104,6 +104,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["score_centering"]="Brcb and strided vector Sub";
         d["online_max_update"]="vector Max/Sub with alternating UB views";
         d["score_row_max"]="two-stage BlockReduceMax";
+        d["score_row_sum"]="two-stage BlockReduceSum";
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";

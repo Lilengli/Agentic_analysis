@@ -25,6 +25,17 @@ __aicore__ inline void ReduceRowMax64(AscendC::LocalTensor<float> row_max,
     AscendC::BlockReduceMax(row_max,partial,Rows/BlockElements,RepeatElements,1,1,8);
 }
 
+template<uint32_t Rows,uint32_t BN>
+__aicore__ inline void ReduceRowSum64(AscendC::LocalTensor<float> row_sum,
+    AscendC::LocalTensor<float> scores, AscendC::LocalTensor<float> partial)
+{
+    constexpr int32_t BlockElements=32/sizeof(float), RepeatElements=256/sizeof(float);
+    // Pack each row's eight partial sums into one data block.
+    AscendC::BlockReduceSum(partial,scores,Rows,RepeatElements,1,1,BN/BlockElements);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::BlockReduceSum(row_sum,partial,Rows/BlockElements,RepeatElements,1,1,8);
+}
+
 template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
@@ -79,10 +90,13 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::WholeReduceSum(sumA,s,64,R,1,1,BN/8);
+    // The preceding barrier releases the scratch used to broadcast row maxima.
+    ReduceRowSum64<R,BN>(sumA,s,row_blocks);
     if constexpr(BN==128) {
-        AscendC::WholeReduceSum(sumB,s[64],64,R,1,1,BN/8);
-        AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(sumA,sumA,sumB,R);
+        AscendC::PipeBarrier<PIPE_V>();
+        ReduceRowSum64<R,BN>(sumB,s[64],row_blocks);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(sumA,sumA,sumB,R);
     }
     AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
     AscendC::Mul(l,l,alpha,R);
