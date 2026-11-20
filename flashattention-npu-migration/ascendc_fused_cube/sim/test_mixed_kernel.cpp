@@ -96,6 +96,9 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV UB buffers exceed or differ from Geometry::UbBytes");
         Require(av->pv_waits.size() == expected_prepared_at_pv_wait.size(),
             "AIV PV wait count does not match the number of KV tiles");
+        Require(av->row_sum_calls_at_p_ready.size() == iterations,
+            "AIV P_READY count does not match the number of KV tiles");
+        constexpr uint64_t sum_calls_per_tile = 2 * (BN / 64);
         for (size_t i = 0; i < av->pv_waits.size(); ++i) {
             const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
             const auto& snapshot = av->pv_waits[i];
@@ -103,10 +106,12 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,
                 "AIV did not reduce the next score before waiting for PV");
-            Require(snapshot.exp_calls == 2 * scores_prepared &&
-                    snapshot.block_reduce_sum_calls == scores_prepared * (BN / 64) * 2,
-                "AIV must finish the next softmax before waiting for PV");
-            Require(snapshot.mul_calls == scores_prepared + (i + 1) * (CubeFA::D / 64),
+            Require(snapshot.exp_calls == 2 * scores_prepared,
+                "AIV must exponentiate the next score tile before waiting for PV");
+            Require(av->row_sum_calls_at_p_ready[i] == i * sum_calls_per_tile &&
+                    snapshot.block_reduce_sum_calls == (i + 1) * sum_calls_per_tile,
+                "AIV must reduce the current denominator between P_READY and the PV wait");
+            Require(snapshot.mul_calls == (i + 1) * mul_calls_per_tile,
                 "AIV must rescale the denominator and output before waiting for PV");
         }
         Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),

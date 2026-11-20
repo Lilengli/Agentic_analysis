@@ -107,6 +107,7 @@ struct Stats {
     uint64_t select_calls = 0;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_done_waits{};
+    std::vector<uint64_t> row_sum_calls_at_p_ready;
     std::vector<PvWaitSnapshot> pv_waits;
     std::array<size_t, 5> local_bytes_by_position{};
 };
@@ -175,6 +176,8 @@ inline void AbortGroup(uint32_t group) noexcept {
 
 inline void SetFlag(uint32_t flag) {
     if (flag >= kFlagCount) throw std::runtime_error("mixed simulator: invalid flag");
+    if (context.core == Core::AIV && flag == CubeFA::P_READY && context.stats)
+        context.stats->row_sum_calls_at_p_ready.push_back(context.stats->block_reduce_sum_calls);
     FlagState& state = GroupFlags(context.group);
     {
         std::lock_guard<std::mutex> lock(state.mutex);

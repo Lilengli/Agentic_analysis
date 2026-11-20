@@ -65,10 +65,9 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
 }
 
 template<uint32_t R,uint32_t BN>
-__aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
-    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> l, AscendC::LocalTensor<float> alpha,
-    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> sumA,
-    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
+__aicore__ inline void PrepareProbabilities(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
+    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> alpha,
+    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> row_blocks)
 {
     constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
     AscendC::PipeBarrier<PIPE_V>();
@@ -90,7 +89,14 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
     AscendC::PipeBarrier<PIPE_V>();
-    // The preceding barrier releases the scratch used to broadcast row maxima.
+    AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
+}
+
+template<uint32_t R,uint32_t BN>
+__aicore__ inline void UpdateDenominator(AscendC::LocalTensor<float> s, AscendC::LocalTensor<float> l,
+    AscendC::LocalTensor<float> alpha, AscendC::LocalTensor<float> sumA,
+    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
+{
     ReduceRowSum64<R,BN>(sumA,s,row_blocks);
     if constexpr(BN==128) {
         AscendC::PipeBarrier<PIPE_V>();
@@ -98,7 +104,6 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(sumA,sumA,sumB,R);
     }
-    AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
     AscendC::Mul(l,l,alpha,R);
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
 }
@@ -224,13 +229,16 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
             PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,gm_slot,
                 masks[mask_offset]);
-            CompleteSoftmax<R,BN>(score_ub,p,m,l,alpha,maxA,sumA,sumB,row_blocks);
+            PrepareProbabilities<R,BN>(score_ub,p,m,alpha,maxA,row_blocks);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
                 // Reuse the final-output staging buffer as the second P slot.
                 auto current_p=ub_slot==0 ? p : oh;
                 Sync<AscendC::HardEvent::V_MTE3>(pipe);
                 AscendC::DataCopy(pgm[sub*R*BN],current_p,R*BN);
                 AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(P_READY);
+                // P's DMA reads the FP16 buffer while the denominator uses the FP32 weights.
+                auto current_s=score_ub[ub_slot*ScoreElements];
+                UpdateDenominator<R,BN>(current_s,l,alpha,sumA,sumB,row_blocks);
                 // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
                 // Rescaling the old output only needs alpha, so queue it before the PV wait.
@@ -250,7 +258,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                         maxA,maxB,row_blocks,gm_slot,masks);
                     // The current alpha has already been used to rescale out.
                     // Keep next_p in UB until the current PV releases the shared GM relay.
-                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha,maxA,sumA,sumB,row_blocks);
+                    PrepareProbabilities<R,BN>(next_s,next_p,m,alpha,maxA,row_blocks);
                 }
                 AscendC::CrossCoreWaitFlag(PV_READY);
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);

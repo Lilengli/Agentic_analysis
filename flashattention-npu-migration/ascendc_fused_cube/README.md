@@ -32,8 +32,8 @@ implementation when a check fails.
    AIV updates the running row maxima and alpha exponents with vector
    Max/Sub, then broadcasts the updated row maxima with Brcb and subtracts them
    across all rows with one Sub call per 64-column segment.
-   Exponentiated weights are cast to FP16 and sent to
-   the relay; FP32 denominators use the weights before this cast.
+   Exponentiated weights are cast to FP16 and sent to the relay. The FP32
+   denominator updates use the retained FP32 weights after queuing P_READY.
 4. AIC waits for both halves and computes `P @ V` using Cube, with FP32 output
    through Fixpipe. Each AIV broadcasts alpha and scales the old output
    with strided vector multiplies while PV is pending. When PV is ready,
@@ -61,10 +61,11 @@ the overlap of the second QK MMAD with the first QK FIX copy and the gap between
 those two FIX copies. Measure end-to-end performance on board.
 
 Each AIV alternates two score buffers and two P views in UB. After queuing a
-tile's P store, it scales the old output with that tile's alpha, then computes
-the next tile's softmax while PV is pending. The final-output staging buffer
-holds the alternate P tile. The next P store reuses the GM relay after the
-current PV has been consumed and TILE_DONE has been issued.
+tile's P store and ready flag, it updates the denominator, scales the old
+output, and prepares the next tile's weights while PV is pending. The
+final-output staging buffer holds the alternate P tile. The next P store
+reuses the GM relay after the current PV has been consumed and TILE_DONE has
+been issued.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
 S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
