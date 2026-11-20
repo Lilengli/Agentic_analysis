@@ -8,25 +8,6 @@
 #endif
 
 namespace CubeFA {
-template<uint32_t BM,uint32_t BN>
-__aicore__ inline void InitCausalMasks(AscendC::LocalTensor<uint32_t> masks, uint32_t sub)
-{
-    using G=Geometry<BM,BN>;
-    constexpr uint32_t WordsPerRow=BN/32;
-    for (uint32_t stripe=0;stripe<BN/BM;++stripe) {
-        for (uint32_t row=0;row<G::Rows;++row) {
-            const uint32_t visible=stripe*BM+sub*G::Rows+row+1;
-            const uint32_t offset=stripe*G::CausalMaskWords+row*WordsPerRow;
-            for (uint32_t word=0;word<WordsPerRow;++word) {
-                const uint32_t column=word*32;
-                const uint32_t count=visible>column ? visible-column : 0;
-                const uint32_t bits=count>=32 ? ~uint32_t{0} : (uint32_t{1}<<count)-1;
-                masks.SetValue(offset+word,bits);
-            }
-        }
-    }
-}
-
 template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
@@ -56,7 +37,7 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
 
 template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
-    GM_ADDR relay,uint32_t heads,uint32_t seq,uint32_t groups)
+    GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
@@ -151,9 +132,15 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
         auto masks=maskB.template Get<uint32_t>();
         auto row_max_blocks=rowMaxBlockB.template Get<float>();
-        // Each alignment repeats across sequence blocks and heads.
-        InitCausalMasks<BM,BN>(masks,sub);
-        Sync<AscendC::HardEvent::S_V>(pipe);
+        if (group<tasks) {
+            constexpr uint32_t MaskWords=MaskWordsPerAiv(BN);
+            AscendC::GlobalTensor<uint32_t> masks_gm;
+            masks_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(causal_masks)+sub*MaskWords,MaskWords);
+            // Load each alignment once while the Cube starts the first QK.
+            AscendC::DataCopy(masks,masks_gm,MaskWords);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
+        }
         for(uint32_t task=group;task<tasks;task+=groups) {
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
@@ -232,10 +219,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 #ifndef CUBE_FA_CPU_SIM
 template<uint32_t BM,uint32_t BN>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
-    GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,uint32_t heads,uint32_t seq,uint32_t groups)
+    GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
+    uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN>(q,k,v,out,relay,heads,seq,groups);
+    RunCore<g_coreType,BM,BN>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

@@ -23,8 +23,9 @@ implementation when a check fails.
    performs causal masking and online softmax. AIC can issue two further QKs
    before waiting for the current tile's probabilities.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
-   row max and sum use vector reduction APIs. Before processing query tiles,
-   each AIV builds packed causal masks in UB for each query alignment. The
+   row max and sum use vector reduction APIs. The host caches packed causal
+   masks in GM by device and tile shape. Each active AIV loads its mask
+   table into UB once before waiting for the first QK tile. The
    diagonal tile applies its mask with one Tensor–Scalar Select call. Each
    AIV broadcasts the updated row maxima with Brcb and subtracts them
    across all rows with one Sub call per 64-column segment.

@@ -87,6 +87,7 @@ struct Stats {
     };
 
     uint64_t gm_read_elements = 0;
+    uint64_t reads_before_first_qk = 0;
     uint64_t gm_write_elements = 0;
     uint64_t mmad_calls = 0;
     uint64_t whole_reduce_max_calls = 0;
@@ -184,6 +185,8 @@ inline void WaitFlag(uint32_t flag) {
     FlagState& state = GroupFlags(context.group);
     std::unique_lock<std::mutex> lock(state.mutex);
     if (context.core == Core::AIV) {
+        if (flag == CubeFA::QK_READY && context.seen_broadcasts[flag] == 0 && context.stats)
+            context.stats->reads_before_first_qk = context.stats->gm_read_elements;
         if (flag == CubeFA::PV_READY && context.stats) {
             auto& stats = *context.stats;
             stats.pv_waits.push_back({stats.gm_read_elements, stats.whole_reduce_max_calls});

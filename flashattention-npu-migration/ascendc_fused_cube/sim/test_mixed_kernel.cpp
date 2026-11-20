@@ -16,10 +16,10 @@ constexpr size_t kGuardBytes = 64;
 
 template<int Core, unsigned BM, unsigned BN>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
-        GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay,
+        GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN>(q, k, v, out, relay, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN>(q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -83,6 +83,9 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC CO1 buffer size is incorrect");
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
+        const uint64_t mask_reads = tasks ? CubeFA::MaskWordsPerAiv(BN) : 0;
+        Require(av->reads_before_first_qk == mask_reads,
+            "AIV must load its packed mask before the first QK wait");
         Require(av->local_bytes_by_position[unsigned(AscendC::TPosition::VECCALC)] == G::UbBytes,
             "AIV UB buffers exceed or differ from Geometry::UbBytes");
         Require(av->pv_waits.size() == expected_prepared_at_pv_wait.size(),
@@ -90,13 +93,13 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         for (size_t i = 0; i < av->pv_waits.size(); ++i) {
             const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
             const auto& snapshot = av->pv_waits[i];
-            Require(snapshot.gm_read_elements == (scores_prepared * BN + i * CubeFA::D) * R,
+            Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.whole_reduce_max_calls == scores_prepared * (BN == 128 ? 2 : 1),
                 "AIV did not reduce the next score before waiting for PV");
         }
-        Require(av->gm_read_elements == iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
-            "AIV score/delta GM read count is incorrect");
+        Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
+            "AIV mask/score/delta GM read count is incorrect");
         Require(av->gm_write_elements == iterations * uint64_t(R) * BN + tasks * uint64_t(R) * CubeFA::D,
             "AIV probability/output GM write count is incorrect");
         const uint64_t reduce_calls = iterations * (BN == 128 ? 2 : 1);
@@ -126,6 +129,9 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     const std::vector<half> original_q = q, original_k = k, original_v = v;
 
     using G = CubeFA::Geometry<BM, BN>;
+    std::vector<uint32_t> masks(2 * CubeFA::MaskWordsPerAiv(BN));
+    CubeFA::PackCausalMasks(masks.data(), BM, BN);
+    GM_ADDR mask_base = reinterpret_cast<GM_ADDR>(masks.data());
     std::vector<uint8_t> relay(kGuardBytes + size_t(groups) * G::RelayBytes + kGuardBytes, kRelayGuard);
     GM_ADDR relay_base = relay.data() + kGuardBytes;
     std::fill(relay_base, relay_base + size_t(groups) * G::RelayBytes, uint8_t(0xff));
@@ -147,7 +153,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
                 RunCore<AscendC::AIC, BM, BN>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
-                    relay_base, heads, seq, groups);
+                    relay_base, mask_base, heads, seq, groups);
             } catch (const std::exception& e) { record_error(group, e); }
         });
         for (uint32_t sub = 0; sub < 2; ++sub) {
@@ -157,7 +163,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
                     RunCore<AscendC::AIV, BM, BN>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
-                        relay_base, heads, seq, groups);
+                        relay_base, mask_base, heads, seq, groups);
                 } catch (const std::exception& e) { record_error(group, e); }
             });
         }

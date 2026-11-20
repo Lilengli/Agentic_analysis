@@ -1,9 +1,32 @@
 #include <torch/extension.h>
 #include <c10/core/DeviceGuard.h>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "acl/acl.h"
 #include "mixed_kernel.hpp"
+
+namespace {
+at::Tensor GetCausalMask(c10::Device device,int64_t bm,int64_t bn)
+{
+    using Key=std::tuple<c10::DeviceIndex,int64_t,int64_t>;
+    static std::mutex mutex;
+    static std::map<Key,at::Tensor> masks;
+    const Key key{device.index(),bm,bn};
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto existing=masks.find(key);
+    if (existing!=masks.end()) return existing->second;
+
+    auto cpu=at::empty({2*CubeFA::MaskWordsPerAiv(bn)},at::TensorOptions().device(at::kCPU).dtype(at::kInt));
+    CubeFA::PackCausalMasks(reinterpret_cast<uint32_t*>(cpu.data_ptr<int32_t>()),bm,bn);
+    auto mask=cpu.to(device,at::kInt,/*non_blocking=*/false,/*copy=*/false);
+    // Publish only after the initial upload, so other NPU streams can use it.
+    c10_npu::getCurrentNPUStream().synchronize();
+    return masks.emplace(key,mask).first->second;
+}
+} // namespace
 
 at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     int64_t bm=64,int64_t bn=128,int64_t groups=24)
@@ -19,6 +42,7 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     const int64_t heads=q.size(0)*q.size(1);
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
     c10::OptionalDeviceGuard guard(q.device());
+    const auto mask=GetCausalMask(q.device(),bm,bn);
     auto out=at::empty_like(q);
     const int64_t per_group=CubeFA::RelayBytesFor(bm,bn);
     // Fixed-size per-group relay; independent of S. Same-stream allocator
@@ -32,11 +56,12 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     auto qp=static_cast<uint8_t*>(q.data_ptr()); auto kp=static_cast<uint8_t*>(k.data_ptr());
     auto vp=static_cast<uint8_t*>(v.data_ptr()); auto op=static_cast<uint8_t*>(out.data_ptr());
     auto wp=static_cast<uint8_t*>(relay.data_ptr()); const uint32_t seq=q.size(2);
-    if(bm==32 && bn==64) CubeFA::fused_cube_attention<32,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,heads,seq,groups);
-    else if(bm==32 && bn==128) CubeFA::fused_cube_attention<32,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,heads,seq,groups);
-    else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,heads,seq,groups);
-    else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,heads,seq,groups);
-    else CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,heads,seq,groups);
+    auto mp=static_cast<uint8_t*>(mask.data_ptr());
+    if(bm==32 && bn==64) CubeFA::fused_cube_attention<32,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(bm==32 && bn==128) CubeFA::fused_cube_attention<32,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     return out;
 }
 
@@ -74,7 +99,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_intermediates"]="three FP32 score slots, one FP16 probability slot, one FP32 PV slot per group";
         d["qk_lookahead_tiles"]=CubeFA::QkLookaheadTiles;
         d["aiv_score_ub_slots"]=CubeFA::UbScoreSlots;
-        d["causal_mask"]="packed UB bitmap with vector Select";
+        d["causal_mask"]="cached packed GM bitmap prefetched to UB for vector Select";
         d["score_centering"]="Brcb and strided vector Sub";
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";
         d["primitive_library"]="CATLASS tile copies and Mmad only; no existing attention operator";
