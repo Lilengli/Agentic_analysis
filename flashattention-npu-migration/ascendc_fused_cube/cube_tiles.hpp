@@ -15,13 +15,14 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
     AscendC::SetFlag<E>(id); AscendC::WaitFlag<E>(id);
 }
 
-template<class ALayout, class BLayout>
+template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     AscendC::GlobalTensor<half> a, AscendC::GlobalTensor<half> b,
     AscendC::GlobalTensor<float> c, AscendC::LocalTensor<half> la,
     AscendC::LocalTensor<half> lb, AscendC::LocalTensor<half> l0a,
     AscendC::LocalTensor<half> l0b, AscendC::LocalTensor<float> l0c,
-    uint32_t m,uint32_t n,uint32_t k,ALayout a_layout,BLayout b_layout,bool load_a=true)
+    uint32_t m,uint32_t n,uint32_t k,ALayout a_layout,BLayout b_layout,bool load_a=true,
+    int32_t l0c_slot=0)
 {
     using Arch=Catlass::Arch::AtlasA2;
     using AT=Catlass::Gemm::GemmType<half,ALayout>;
@@ -45,11 +46,23 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     typename Copies::CopyL1ToL0A{}(l0a,la,al0,al1);
     typename Copies::CopyL1ToL0B{}(l0b,lb,bl0,bl1);
     Sync<AscendC::HardEvent::MTE1_M>(pipe);
-    Sync<AscendC::HardEvent::FIX_M>(pipe);
+    if constexpr (DoubleBufferedL0C) {
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+    } else {
+        Sync<AscendC::HardEvent::FIX_M>(pipe);
+    }
     // TileMmad lowers directly to AscendC::Mmad (AIC Cube), FP32 accumulation.
     Catlass::Gemm::Tile::TileMmad<Arch,AT,BT,void>{}(l0c,l0a,l0b,m,n,k,true);
-    Sync<AscendC::HardEvent::M_FIX>(pipe);
+    if constexpr (DoubleBufferedL0C) {
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+    } else {
+        Sync<AscendC::HardEvent::M_FIX>(pipe);
+    }
     typename Copies::CopyL0CToGm{}(c,l0c,Catlass::layout::RowMajor(m,n),cl0);
+    if constexpr (DoubleBufferedL0C) {
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+    }
 }
 
 // Isolate physical Cube/layout behavior from cross-core scheduling in tests.

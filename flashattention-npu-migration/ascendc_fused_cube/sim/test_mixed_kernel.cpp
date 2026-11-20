@@ -65,7 +65,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC A2 buffer size is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::B2)] == uint64_t(BN) * CubeFA::D * 2,
         "AIC B2 buffer size is incorrect");
-    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::CO1)] == uint64_t(BM) * MaxN * 4,
+    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::CO1)] == 2 * uint64_t(BM) * MaxN * 4,
         "AIC CO1 buffer size is incorrect");
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {

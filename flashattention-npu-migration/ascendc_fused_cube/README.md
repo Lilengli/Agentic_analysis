@@ -37,15 +37,17 @@ Default BM64/BN128 uses 112 KiB of relay per group, or **2.625 MiB for 24 groups
 independent of sequence length. BM32/BN64 uses 36 KiB per group and BM128/BN128
 uses 224 KiB. The extra score slot increases workspace capacity without
 adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
-64/16/32/32 KiB, respectively; source UB allocation per AIV is 66,432 bytes,
+64/16/32/64 KiB, respectively; source UB allocation per AIV is 66,432 bytes,
 excluding compiler overhead/spills.
 
 The two score slots have separate ready flags, QK_READY and QK_NEXT_READY
 (FIX). P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) are shared across
 iterations. AIC waits for both AIVs' TILE_DONE before reusing the completed
-tile's slot and the shared probability and PV relays. The L0C buffer and
-Gemm's Fixpipe reuse barriers are unchanged. Use a device trace to check that
-the next QK is issued before the current P_READY, and measure speedup on board.
+tile's slot and the shared probability and PV relays. The AIC alternates two
+L0C slots across QK and PV products. Each slot's M_FIX event gates its copy to
+GM, and its FIX_M event gates reuse after that copy. On a device trace, compare
+the overlap of the second QK MMAD with the first QK FIX copy and the gap between
+those two FIX copies. Measure end-to-end performance on board.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
 S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
@@ -129,7 +131,7 @@ physical HBM traffic. For S=16384, batch*heads=2 it predicts 7240 MiB total for
 
 The 128x128 shape requires CANN compilation and independent device correctness
 and performance validation. The default remains 64x128. Each AIV uses about
-132864 bytes of UB and AIC uses 64 KiB of L0C. CPU simulation cannot validate
+132864 bytes of UB and AIC uses two 64 KiB L0C slots. CPU simulation cannot validate
 device lowering, hardware buffer limits, event synchronization or performance.
 
 ```
