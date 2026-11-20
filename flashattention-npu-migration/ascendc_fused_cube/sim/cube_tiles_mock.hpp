@@ -318,6 +318,20 @@ template <class T> void Duplicate(LocalTensor<T> destination, T value, size_t n)
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, value);
     CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
 }
+inline void Duplicate(LocalTensor<float> destination, float value, const uint64_t mask[],
+        uint8_t repeats, uint16_t block_stride, uint8_t repeat_stride) {
+    constexpr size_t block_elements = 32 / sizeof(float);
+    if (destination.offset % 32 || !mask[0] || mask[1] || !repeats)
+        throw std::runtime_error("mixed simulator: invalid masked FP32 Duplicate");
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        for (size_t lane = 0; lane < 64; ++lane) {
+            if (!(mask[0] & (uint64_t{1} << lane))) continue;
+            const size_t block = repeat * repeat_stride + lane / block_elements * block_stride;
+            destination.SetValue(block * block_elements + lane % block_elements, value);
+        }
+    }
+    CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
+}
 
 template <class T> void WholeReduceMax(LocalTensor<T> destination, LocalTensor<T> source,
         int mask, int repeats, int dstStride, int blockStride, int repStride, ReduceOrder) {

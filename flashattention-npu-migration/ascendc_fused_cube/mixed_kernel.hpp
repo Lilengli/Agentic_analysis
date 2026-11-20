@@ -8,6 +8,35 @@
 #endif
 
 namespace CubeFA {
+template<uint32_t Rows, uint32_t Cols>
+__aicore__ inline void MaskFutureScores(AscendC::LocalTensor<float> scores, uint32_t first_visible)
+{
+    constexpr uint32_t lanes = 64;  // One 256-byte FP32 vector repeat.
+    constexpr uint8_t row_stride = Cols * sizeof(float) / 32;  // In datablocks.
+    constexpr uint64_t all_lanes = ~uint64_t{0};
+    constexpr float blocked_score = -3.402823466e+38F;
+
+    if constexpr (Cols == 2 * lanes) {
+        if (first_visible <= lanes) {
+            const uint32_t full = lanes + 1 - first_visible;
+            const uint8_t repeats = static_cast<uint8_t>(full < Rows ? full : Rows);
+            // In these rows, all of the second 64-column segment is masked.
+            uint64_t mask[2] = {all_lanes, 0};
+            AscendC::Duplicate(scores[lanes], blocked_score, mask, repeats, 1, row_stride);
+        }
+    }
+
+    for (uint32_t row = 0; row < Rows && first_visible + row < Cols; ++row) {
+        const uint32_t visible = first_visible + row;
+        const uint32_t lane = visible % lanes;
+        if (lane == 0) continue;  // The fully masked segment was filled above.
+        // Keep the segment base aligned and preserve its visible prefix.
+        uint64_t mask[2] = {all_lanes << lane, 0};
+        const uint32_t segment_base = visible - lane;
+        AscendC::Duplicate(scores[row * Cols + segment_base], blocked_score, mask, 1, 1, row_stride);
+    }
+}
+
 template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,uint32_t heads,uint32_t seq,uint32_t groups)
@@ -84,13 +113,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 AscendC::DataCopy(s,sgm[sub*R*BN],R*BN);
                 Sync<AscendC::HardEvent::MTE2_V>(pipe);
                 AscendC::Muls(s,s,0.08838834764831845f,R*BN);
-                Sync<AscendC::HardEvent::V_S>(pipe);
-                // Only the diagonal key block needs scalar mask edits.
-                if(uint32_t(ks)==(qs/BN)*BN) for(uint32_t r=0;r<R;++r) {
-                    const uint32_t visible=qs+sub*R+r-uint32_t(ks)+1;
-                    for(uint32_t j=visible;j<BN;++j) s.SetValue(r*BN+j,-3.402823466e+38F);
+                AscendC::PipeBarrier<PIPE_V>();
+                if(uint32_t(ks)==(qs/BN)*BN) {
+                    MaskFutureScores<R,BN>(s, qs+sub*R-uint32_t(ks)+1);
+                    AscendC::PipeBarrier<PIPE_V>();
                 }
-                Sync<AscendC::HardEvent::S_V>(pipe);
                 AscendC::WholeReduceMax(maxA,s,64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
                 if constexpr(BN==128) {
                     AscendC::WholeReduceMax(maxB,s[64],64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);

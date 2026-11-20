@@ -84,8 +84,11 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV per-row score shift count is incorrect");
         Require(av->mul_calls == iterations && av->exp_calls == 2 * iterations,
             "AIV online-softmax vector operation counts are incorrect");
-        Require(av->cast_calls == iterations + tasks && av->duplicate_calls == 3 * tasks,
-            "AIV probability or output conversion/initialization count is incorrect");
+        Require(av->cast_calls == iterations + tasks,
+            "AIV probability or output conversion count is incorrect");
+        // Three initializations plus R-1..R+1 vector fills per diagonal tile.
+        Require(av->duplicate_calls >= (R + 2) * tasks && av->duplicate_calls <= (R + 4) * tasks,
+            "AIV initialization and diagonal mask fill count is incorrect");
     }
 }
 
