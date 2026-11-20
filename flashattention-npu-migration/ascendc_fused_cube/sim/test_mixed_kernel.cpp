@@ -103,7 +103,10 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,
                 "AIV did not reduce the next score before waiting for PV");
-            Require(snapshot.mul_calls == (i + 1) * mul_calls_per_tile,
+            Require(snapshot.exp_calls == 2 * scores_prepared &&
+                    snapshot.whole_reduce_sum_calls == scores_prepared * (BN / 64),
+                "AIV must finish the next softmax before waiting for PV");
+            Require(snapshot.mul_calls == scores_prepared + (i + 1) * (CubeFA::D / 64),
                 "AIV must rescale the denominator and output before waiting for PV");
         }
         Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),

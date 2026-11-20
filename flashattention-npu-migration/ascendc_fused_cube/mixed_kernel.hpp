@@ -53,6 +53,42 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     }
 }
 
+template<uint32_t R,uint32_t BN>
+__aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
+    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> l, AscendC::LocalTensor<float> alpha,
+    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> sumA,
+    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
+{
+    constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Max(maxA,maxA,m,R);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Sub(alpha,m,maxA,R);
+    // Keep the updated maxima by exchanging the two UB views.
+    // The old running buffer becomes scratch for the next reduction.
+    auto previous_m=m;
+    m=maxA;
+    maxA=previous_m;
+    AscendC::Brcb(row_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+    AscendC::PipeBarrier<PIPE_V>();
+    // Reuse one 32-byte max block across each 64-column repeat, then advance a row.
+    for (uint32_t col=0;col<BN;col+=Fp32Repeat) {
+        AscendC::Sub(s[col],s[col],row_blocks,uint64_t{Fp32Repeat},R,
+            AscendC::BinaryRepeatParams(1,1,0,BN/Fp32Block,BN/Fp32Block,1));
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::WholeReduceSum(sumA,s,64,R,1,1,BN/8);
+    if constexpr(BN==128) {
+        AscendC::WholeReduceSum(sumB,s[64],64,R,1,1,BN/8);
+        AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(sumA,sumA,sumB,R);
+    }
+    AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
+    AscendC::Mul(l,l,alpha,R);
+    AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
+}
+
 template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
@@ -133,6 +169,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         constexpr uint32_t ScoreElements=R*BN;
         constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
         static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0 && D%Fp32Repeat==0);
+        static_assert(BN<=D);  // The final-output staging buffer also holds a P tile.
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
@@ -173,37 +210,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
             PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,gm_slot,
                 masks[mask_offset]);
+            CompleteSoftmax<R,BN>(score_ub,p,m,l,alpha,maxA,sumA,sumB,row_blocks);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
-                auto s=score_ub[ub_slot*ScoreElements];
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Max(maxA,maxA,m,R);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Sub(alpha,m,maxA,R);
-                // Keep the updated maxima by exchanging the two UB views.
-                // The old running buffer becomes scratch for the next reduction.
-                auto previous_m=m;
-                m=maxA;
-                maxA=previous_m;
-                AscendC::Brcb(row_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
-                AscendC::PipeBarrier<PIPE_V>();
-                // Reuse one 32-byte max block across each 64-column repeat, then advance a row.
-                for (uint32_t col=0;col<BN;col+=Fp32Repeat) {
-                    AscendC::Sub(s[col],s[col],row_blocks,uint64_t{Fp32Repeat},R,
-                        AscendC::BinaryRepeatParams(1,1,0,BN/Fp32Block,BN/Fp32Block,1));
-                }
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::WholeReduceSum(sumA,s,64,R,1,1,BN/8);
-                if constexpr(BN==128) {
-                    AscendC::WholeReduceSum(sumB,s[64],64,R,1,1,BN/8);
-                    AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(sumA,sumA,sumB,R);
-                }
-                AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
-                AscendC::Mul(l,l,alpha,R);
-                AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
+                // Reuse the final-output staging buffer as the second P slot.
+                auto current_p=ub_slot==0 ? p : oh;
                 Sync<AscendC::HardEvent::V_MTE3>(pipe);
-                AscendC::DataCopy(pgm[sub*R*BN],p,R*BN);
+                AscendC::DataCopy(pgm[sub*R*BN],current_p,R*BN);
                 AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(P_READY);
                 // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
@@ -218,9 +230,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     gm_slot=gm_slot+1==ScoreSlots ? 0 : gm_slot+1;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
                     // QK for the next tile is issued before AIC waits for this P_READY.
-                    // Only score-local math runs here, so alpha remains valid for this PV.
-                    PrepareScoreTile<R,BN,false>(score_ub[(ub_slot^1)*ScoreElements],
-                        sgm[next_score_offset+score_row_offset],maxA,maxB,row_blocks,gm_slot,masks);
+                    auto next_s=score_ub[(ub_slot^1)*ScoreElements];
+                    auto next_p=ub_slot==0 ? oh : p;
+                    PrepareScoreTile<R,BN,false>(next_s,sgm[next_score_offset+score_row_offset],
+                        maxA,maxB,row_blocks,gm_slot,masks);
+                    // The current alpha has already been used to rescale out.
+                    // Keep next_p in UB until the current PV releases the shared GM relay.
+                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha,maxA,sumA,sumB,row_blocks);
                 }
                 AscendC::CrossCoreWaitFlag(PV_READY);
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);

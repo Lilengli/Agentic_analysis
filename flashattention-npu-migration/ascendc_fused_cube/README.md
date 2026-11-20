@@ -60,10 +60,11 @@ GM, and its FIX_M event gates reuse after that copy. On a device trace, compare
 the overlap of the second QK MMAD with the first QK FIX copy and the gap between
 those two FIX copies. Measure end-to-end performance on board.
 
-Each AIV alternates two score buffers in UB. After queuing a tile's P store
-and before waiting for its PV result, it loads the next score tile, scales
-it and computes its row maxima. The current output update still uses its own
-alpha, and the next tile consumes its prepared scores after TILE_DONE.
+Each AIV alternates two score buffers and two P views in UB. After queuing a
+tile's P store, it scales the old output with that tile's alpha, then computes
+the next tile's softmax while PV is pending. The final-output staging buffer
+holds the alternate P tile. The next P store reuses the GM relay after the
+current PV has been consumed and TILE_DONE has been issued.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
 S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,

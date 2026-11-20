@@ -85,6 +85,8 @@ struct Stats {
         uint64_t gm_read_elements;
         uint64_t block_reduce_max_calls;
         uint64_t mul_calls;
+        uint64_t exp_calls;
+        uint64_t whole_reduce_sum_calls;
     };
 
     uint64_t gm_read_elements = 0;
@@ -191,7 +193,8 @@ inline void WaitFlag(uint32_t flag) {
             context.stats->reads_before_first_qk = context.stats->gm_read_elements;
         if (flag == CubeFA::PV_READY && context.stats) {
             auto& stats = *context.stats;
-            stats.pv_waits.push_back({stats.gm_read_elements, stats.block_reduce_max_calls, stats.mul_calls});
+            stats.pv_waits.push_back({stats.gm_read_elements, stats.block_reduce_max_calls,
+                stats.mul_calls, stats.exp_calls, stats.whole_reduce_sum_calls});
         }
         const uint64_t target = context.seen_broadcasts[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
