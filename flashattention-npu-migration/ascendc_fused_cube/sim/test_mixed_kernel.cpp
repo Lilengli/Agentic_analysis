@@ -101,7 +101,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             const auto& snapshot = av->pv_waits[i];
             Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
-            Require(snapshot.whole_reduce_max_calls == scores_prepared * (BN == 128 ? 2 : 1),
+            Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,
                 "AIV did not reduce the next score before waiting for PV");
             Require(snapshot.mul_calls == (i + 1) * mul_calls_per_tile,
                 "AIV must rescale the denominator and output before waiting for PV");
@@ -110,8 +110,8 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV mask/score/delta GM read count is incorrect");
         Require(av->gm_write_elements == iterations * uint64_t(R) * BN + tasks * uint64_t(R) * CubeFA::D,
             "AIV probability/output GM write count is incorrect");
-        const uint64_t reduce_calls = iterations * (BN == 128 ? 2 : 1);
-        Require(av->whole_reduce_max_calls == reduce_calls && av->whole_reduce_sum_calls == reduce_calls,
+        const uint64_t reduce_calls = iterations * (BN / 64);
+        Require(av->block_reduce_max_calls == 2 * reduce_calls && av->whole_reduce_sum_calls == reduce_calls,
             "AIV reduction calls do not match the score tile width");
         Require(av->max_calls == iterations * (BN == 128 ? 2 : 1),
             "AIV must combine the split maxima and update the running maxima as vectors");

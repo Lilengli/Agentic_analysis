@@ -13,10 +13,23 @@ __aicore__ inline uint16_t ScoreReadyFlag(uint32_t slot)
     return slot==0 ? QK_READY : QK_EXTRA_READY_BASE+slot-1;
 }
 
+template<uint32_t Rows,uint32_t BN>
+__aicore__ inline void ReduceRowMax64(AscendC::LocalTensor<float> row_max,
+    AscendC::LocalTensor<float> scores, AscendC::LocalTensor<float> partial)
+{
+    constexpr int32_t BlockElements=32/sizeof(float), RepeatElements=256/sizeof(float);
+    // Each row's first reduction produces eight maxima in one data block.
+    AscendC::BlockReduceMax(partial,scores,Rows,RepeatElements,1,1,BN/BlockElements);
+    AscendC::PipeBarrier<PIPE_V>();
+    // One repeat now covers the partial maxima from eight consecutive rows.
+    AscendC::BlockReduceMax(row_max,partial,Rows/BlockElements,RepeatElements,1,1,8);
+}
+
 template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
-    AscendC::LocalTensor<float> maxB, uint32_t gm_slot, AscendC::LocalTensor<uint32_t> causal_mask)
+    AscendC::LocalTensor<float> maxB, AscendC::LocalTensor<float> row_blocks,
+    uint32_t gm_slot, AscendC::LocalTensor<uint32_t> causal_mask)
 {
     AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
     AscendC::DataCopy(s,scores,Rows*BN);
@@ -30,9 +43,11 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
             AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,Rows*BN);
         AscendC::PipeBarrier<PIPE_V>();
     }
-    AscendC::WholeReduceMax(maxA,s,64,Rows,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+    // The preceding barrier has released the row-block scratch used by output rescale.
+    ReduceRowMax64<Rows,BN>(maxA,s,row_blocks);
     if constexpr(BN==128) {
-        AscendC::WholeReduceMax(maxB,s[64],64,Rows,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        ReduceRowMax64<Rows,BN>(maxB,s[64],row_blocks);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Max(maxA,maxA,maxB,Rows);
     }
@@ -134,7 +149,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         auto maxA=maxAB.template Get<float>(); auto maxB=maxBB.template Get<float>();
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
         auto masks=maskB.template Get<uint32_t>();
-        auto row_max_blocks=rowMaxBlockB.template Get<float>();
+        auto row_blocks=rowMaxBlockB.template Get<float>();
         if (group<tasks) {
             constexpr uint32_t MaskWords=G::CausalMaskBytes/sizeof(uint32_t);
             AscendC::GlobalTensor<uint32_t> masks_gm;
@@ -156,7 +171,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             uint32_t gm_slot=0, ub_slot=0;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,gm_slot,
+            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,gm_slot,
                 masks[mask_offset]);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
                 auto s=score_ub[ub_slot*ScoreElements];
@@ -169,11 +184,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 auto previous_m=m;
                 m=maxA;
                 maxA=previous_m;
-                AscendC::Brcb(row_max_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::Brcb(row_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
                 AscendC::PipeBarrier<PIPE_V>();
                 // Reuse one 32-byte max block across each 64-column repeat, then advance a row.
                 for (uint32_t col=0;col<BN;col+=Fp32Repeat) {
-                    AscendC::Sub(s[col],s[col],row_max_blocks,uint64_t{Fp32Repeat},R,
+                    AscendC::Sub(s[col],s[col],row_blocks,uint64_t{Fp32Repeat},R,
                         AscendC::BinaryRepeatParams(1,1,0,BN/Fp32Block,BN/Fp32Block,1));
                 }
                 AscendC::PipeBarrier<PIPE_V>();
@@ -193,10 +208,10 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
                 // Rescaling the old output only needs alpha, so queue it before the PV wait.
-                AscendC::Brcb(row_max_blocks,alpha,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::Brcb(row_blocks,alpha,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
                 AscendC::PipeBarrier<PIPE_V>();
                 for (uint32_t col=0;col<D;col+=Fp32Repeat) {
-                    AscendC::Mul(out[col],out[col],row_max_blocks,uint64_t{Fp32Repeat},R,
+                    AscendC::Mul(out[col],out[col],row_blocks,uint64_t{Fp32Repeat},R,
                         AscendC::BinaryRepeatParams(1,1,0,D/Fp32Block,D/Fp32Block,1));
                 }
                 if (ks>=int32_t(BN)) {
@@ -205,7 +220,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     // QK for the next tile is issued before AIC waits for this P_READY.
                     // Only score-local math runs here, so alpha remains valid for this PV.
                     PrepareScoreTile<R,BN,false>(score_ub[(ub_slot^1)*ScoreElements],
-                        sgm[next_score_offset+score_row_offset],maxA,maxB,gm_slot,masks);
+                        sgm[next_score_offset+score_row_offset],maxA,maxB,row_blocks,gm_slot,masks);
                 }
                 AscendC::CrossCoreWaitFlag(PV_READY);
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);

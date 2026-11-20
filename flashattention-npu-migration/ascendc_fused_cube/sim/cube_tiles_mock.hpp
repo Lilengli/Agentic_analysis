@@ -83,7 +83,7 @@ constexpr std::chrono::seconds kWaitTimeout{5};
 struct Stats {
     struct PvWaitSnapshot {
         uint64_t gm_read_elements;
-        uint64_t whole_reduce_max_calls;
+        uint64_t block_reduce_max_calls;
         uint64_t mul_calls;
     };
 
@@ -91,7 +91,7 @@ struct Stats {
     uint64_t reads_before_first_qk = 0;
     uint64_t gm_write_elements = 0;
     uint64_t mmad_calls = 0;
-    uint64_t whole_reduce_max_calls = 0;
+    uint64_t block_reduce_max_calls = 0;
     uint64_t whole_reduce_sum_calls = 0;
     uint64_t max_calls = 0;
     uint64_t brcb_calls = 0;
@@ -191,7 +191,7 @@ inline void WaitFlag(uint32_t flag) {
             context.stats->reads_before_first_qk = context.stats->gm_read_elements;
         if (flag == CubeFA::PV_READY && context.stats) {
             auto& stats = *context.stats;
-            stats.pv_waits.push_back({stats.gm_read_elements, stats.whole_reduce_max_calls, stats.mul_calls});
+            stats.pv_waits.push_back({stats.gm_read_elements, stats.block_reduce_max_calls, stats.mul_calls});
         }
         const uint64_t target = context.seen_broadcasts[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
@@ -376,19 +376,21 @@ inline void Select(LocalTensor<float> destination, LocalTensor<uint32_t> mask,
     CubeFASim::CountVector(&CubeFASim::Stats::select_calls);
 }
 
-template <class T> void WholeReduceMax(LocalTensor<T> destination, LocalTensor<T> source,
-        int mask, int repeats, int dstStride, int blockStride, int repStride, ReduceOrder) {
-    constexpr int block = 32 / sizeof(T);
-    if (mask <= 0 || repeats < 0) throw std::runtime_error("mixed simulator: invalid WholeReduceMax shape");
-    for (int r = 0; r < repeats; ++r) {
-        T value = source.GetValue(size_t(r * repStride * block));
-        for (int i = 1; i < mask; ++i) {
-            const size_t index = size_t(r * repStride * block + (i / block) * blockStride * block + i % block);
-            value = std::max(value, source.GetValue(index));
+inline void BlockReduceMax(LocalTensor<float> destination, LocalTensor<float> source,
+        int repeats, int mask, int dst_stride, int block_stride, int src_stride) {
+    constexpr int block = 32 / sizeof(float), blocks_per_repeat = 8;
+    if (mask != block * blocks_per_repeat || repeats < 0 || destination.offset % 32 || source.offset % 32)
+        throw std::runtime_error("mixed simulator: invalid full-width BlockReduceMax operands");
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        for (int group = 0; group < blocks_per_repeat; ++group) {
+            const size_t offset = (repeat * src_stride + group * block_stride) * block;
+            float value = source.GetValue(offset);
+            for (int i = 1; i < block; ++i)
+                value = std::max(value, source.GetValue(offset + i));
+            destination.SetValue(repeat * dst_stride * blocks_per_repeat + group, value);
         }
-        destination.SetValue(size_t(r * dstStride), value);
     }
-    CubeFASim::CountVector(&CubeFASim::Stats::whole_reduce_max_calls);
+    CubeFASim::CountVector(&CubeFASim::Stats::block_reduce_max_calls);
 }
 template <class T> void WholeReduceSum(LocalTensor<T> destination, LocalTensor<T> source,
         int mask, int repeats, int dstStride, int blockStride, int repStride) {
