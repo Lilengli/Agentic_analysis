@@ -71,8 +71,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_relay_bytes_per_group_bm64_bn64"]=CubeFA::Geometry<64,64>::RelayBytes;
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
-        d["gm_intermediates"]="two FP32 score slots, one FP16 probability slot, one FP32 PV slot per group";
-        d["qk_lookahead_tiles"]=1;
+        d["gm_intermediates"]="three FP32 score slots, one FP16 probability slot, one FP32 PV slot per group";
+        d["qk_lookahead_tiles"]=CubeFA::QkLookaheadTiles;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";
         d["primitive_library"]="CATLASS tile copies and Mmad only; no existing attention operator";
         return d;

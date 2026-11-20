@@ -52,7 +52,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     kgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k),uint64_t(heads)*seq*D);
     vgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v),uint64_t(heads)*seq*D);
     ogm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output),uint64_t(heads)*seq*D);
-    // Score slots live at the start and end of the same per-group relay.
+    // The first score slot precedes P/PV; the remaining score slots follow them.
     sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),G::RelayBytes/sizeof(float));
     pgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(relay+offset+G::SBytes),BM*BN);
     dgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset+G::SBytes+G::PBytes),BM*D);
@@ -85,18 +85,20 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             constexpr int32_t step=BN;
             const int32_t first_key=(qs/BN)*BN;
             uint32_t slot=0;
-            for (int32_t qk_key=first_key, pv_key=first_key+step;
-                 pv_key>=0; qk_key-=step, pv_key-=step, slot^=1) {
+            for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
+                 pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
                 if (qk_key>=0) {
+                    const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
                     Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(qk_key)*D],
-                        sgm[slot ? second_score : 0],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                        sgm[score_offset],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
                         BM,BN,D,Catlass::layout::RowMajor(BM,D),Catlass::layout::ColumnMajor(D,BN,D),
                         qk_key==first_key,accum_slot);
                     accum_slot^=1;
-                    if (slot) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_NEXT_READY);
-                    else AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+                    if (slot==0) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+                    else if (slot==1) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_NEXT_READY);
+                    else AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_THIRD_READY);
                 }
-                // Prime QK for the first tile, then consume PV one tile behind.
+                // Prime up to three QKs, then consume PV two tiles behind QK.
                 if (pv_key>first_key) continue;
                 AscendC::CrossCoreWaitFlag(P_READY);
                 Gemm<true>(pipe,pgm,vgm[base+uint64_t(pv_key)*D],dgm,pl,bl,a0,b0,
@@ -131,11 +133,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::Duplicate(m,-3.402823466e+38F,R);
             AscendC::PipeBarrier<PIPE_V>();
             uint32_t slot=0;
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN),slot^=1) {
-                if (slot) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
-                else AscendC::CrossCoreWaitFlag(QK_READY);
+            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN),slot=slot+1==ScoreSlots ? 0 : slot+1) {
+                if (slot==0) AscendC::CrossCoreWaitFlag(QK_READY);
+                else if (slot==1) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
+                else AscendC::CrossCoreWaitFlag(QK_THIRD_READY);
+                const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
-                AscendC::DataCopy(s,sgm[(slot ? second_score : 0)+sub*R*BN],R*BN);
+                AscendC::DataCopy(s,sgm[score_offset+sub*R*BN],R*BN);
                 Sync<AscendC::HardEvent::MTE2_V>(pipe);
                 AscendC::Muls(s,s,0.08838834764831845f,R*BN);
                 AscendC::PipeBarrier<PIPE_V>();

@@ -3,6 +3,8 @@
 // validate device compilation/lowering.
 #pragma once
 
+#include "../geometry.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -74,7 +76,7 @@ constexpr int PIPE_MTE3 = 2;
 constexpr int PIPE_FIX = 3;
 
 namespace CubeFASim {
-constexpr unsigned kFlagCount = 5;
+constexpr unsigned kFlagCount = CubeFA::QK_THIRD_READY + 1;
 constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
 
@@ -92,6 +94,7 @@ struct Stats {
     uint64_t exp_calls = 0;
     uint64_t cast_calls = 0;
     uint64_t duplicate_calls = 0;
+    std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
     std::array<size_t, 5> local_bytes_by_position{};
 };
 
@@ -184,6 +187,14 @@ inline void WaitFlag(uint32_t flag) {
         if (state.aborted) throw std::runtime_error("mixed simulator: group aborted while waiting for AIC broadcast");
         ++context.seen_broadcasts[flag];
     } else {
+        if (flag == CubeFA::P_READY && context.stats) {
+            const uint64_t sent = state.broadcasts[CubeFA::QK_READY] +
+                state.broadcasts[CubeFA::QK_NEXT_READY] + state.broadcasts[CubeFA::QK_THIRD_READY];
+            const uint64_t pending = sent - context.waited_arrivals[CubeFA::P_READY];
+            if (pending == 0 || pending > CubeFA::ScoreSlots)
+                throw std::runtime_error("mixed simulator: score queue depth out of bounds");
+            ++context.stats->pending_qk_at_p_waits[pending];
+        }
         const uint64_t target = (context.waited_arrivals[flag] + 1) * kAivCount;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
                 return state.aborted || state.arrivals[flag] >= target;
