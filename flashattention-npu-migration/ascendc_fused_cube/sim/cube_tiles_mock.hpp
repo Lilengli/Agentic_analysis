@@ -84,6 +84,7 @@ struct Stats {
     struct PvWaitSnapshot {
         uint64_t gm_read_elements;
         uint64_t whole_reduce_max_calls;
+        uint64_t mul_calls;
     };
 
     uint64_t gm_read_elements = 0;
@@ -190,7 +191,7 @@ inline void WaitFlag(uint32_t flag) {
             context.stats->reads_before_first_qk = context.stats->gm_read_elements;
         if (flag == CubeFA::PV_READY && context.stats) {
             auto& stats = *context.stats;
-            stats.pv_waits.push_back({stats.gm_read_elements, stats.whole_reduce_max_calls});
+            stats.pv_waits.push_back({stats.gm_read_elements, stats.whole_reduce_max_calls, stats.mul_calls});
         }
         const uint64_t target = context.seen_broadcasts[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
@@ -432,8 +433,9 @@ struct BinaryRepeatParams {
         : block_stride{db, ab, bb}, repeat_stride{dr, ar, br} {}
 };
 
-inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
-        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+template <class Op>
+void RepeatBinary(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params, Op op) {
     constexpr size_t block = 32 / sizeof(float);
     for (size_t repeat = 0; repeat < repeats; ++repeat) {
         for (size_t lane = 0; lane < mask; ++lane) {
@@ -441,9 +443,13 @@ inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTenso
                 return (repeat * params.repeat_stride[operand] + lane / block *
                     params.block_stride[operand]) * block + lane % block;
             };
-            destination.SetValue(offset(0), a.GetValue(offset(1)) - b.GetValue(offset(2)));
+            destination.SetValue(offset(0), op(a.GetValue(offset(1)), b.GetValue(offset(2))));
         }
     }
+}
+inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs - rhs; });
     CubeFASim::CountVector(&CubeFASim::Stats::sub_calls);
 }
 inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b, size_t n) {
@@ -461,6 +467,11 @@ template <class T> void Add(LocalTensor<T> destination, LocalTensor<T> a, LocalT
 template <class T> void Mul(LocalTensor<T> destination, LocalTensor<T> a, LocalTensor<T> b, size_t n) {
     if (n > destination.length || n > a.length || n > b.length) throw std::runtime_error("mixed simulator: Mul out of bounds");
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, a.GetValue(i) * b.GetValue(i));
+    CubeFASim::CountVector(&CubeFASim::Stats::mul_calls);
+}
+inline void Mul(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs * rhs; });
     CubeFASim::CountVector(&CubeFASim::Stats::mul_calls);
 }
 template <class T> void Muls(LocalTensor<T> destination, LocalTensor<T> source, T scalar, size_t n) {

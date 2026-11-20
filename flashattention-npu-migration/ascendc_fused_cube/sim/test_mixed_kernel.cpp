@@ -88,6 +88,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC CO1 buffer size is incorrect");
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
+        constexpr uint64_t mul_calls_per_tile = 1 + CubeFA::D / 64;
         const uint64_t mask_reads = tasks ? CubeFA::MaskWordsPerAiv(BN) : 0;
         Require(av->reads_before_first_qk == mask_reads,
             "AIV must load its packed mask before the first QK wait");
@@ -102,6 +103,8 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.whole_reduce_max_calls == scores_prepared * (BN == 128 ? 2 : 1),
                 "AIV did not reduce the next score before waiting for PV");
+            Require(snapshot.mul_calls == (i + 1) * mul_calls_per_tile,
+                "AIV must rescale the denominator and output before waiting for PV");
         }
         Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
             "AIV mask/score/delta GM read count is incorrect");
@@ -112,9 +115,9 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV reduction calls do not match the score tile width");
         Require(av->max_calls == iterations * (BN == 128 ? 2 : 1),
             "AIV must combine the split maxima and update the running maxima as vectors");
-        Require(av->brcb_calls == iterations && av->sub_calls == iterations * (1 + BN / 64),
-            "AIV must compute the alpha exponent and subtract broadcast maxima with vector operations");
-        Require(av->mul_calls == iterations && av->exp_calls == 2 * iterations,
+        Require(av->brcb_calls == 2 * iterations && av->sub_calls == iterations * (1 + BN / 64),
+            "AIV must broadcast both the updated maxima and the output rescale factors");
+        Require(av->mul_calls == mul_calls_per_tile * iterations && av->exp_calls == 2 * iterations,
             "AIV online-softmax vector operation counts are incorrect");
         Require(av->cast_calls == iterations + tasks,
             "AIV probability or output conversion count is incorrect");

@@ -34,8 +34,10 @@ implementation when a check fails.
    Exponentiated weights are cast to FP16 and sent to
    the relay; FP32 denominators use the weights before this cast.
 4. AIC waits for both halves and computes `P @ V` using Cube, with FP32 output
-   through Fixpipe. Both AIVs DMA-load their result rows and update accumulated
-   output with the online rescale factor. A reverse handshake protects relay
+   through Fixpipe. Each AIV broadcasts alpha and scales the old output
+   with strided vector multiplies while PV is pending. When PV is ready,
+   the AIV DMA-loads its result rows and adds them to the scaled output.
+   A reverse handshake protects relay
    reuse. Final normalized output is written once per query tile.
 
 This design intentionally uses **bounded GM relay transfers**. It does not

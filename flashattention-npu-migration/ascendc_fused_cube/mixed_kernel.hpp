@@ -117,7 +117,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         constexpr uint32_t R=G::Rows;
         constexpr uint32_t ScoreElements=R*BN;
         constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
-        static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0);
+        static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0 && D%Fp32Repeat==0);
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
@@ -192,6 +192,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(P_READY);
                 // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
+                // Rescaling the old output only needs alpha, so queue it before the PV wait.
+                AscendC::Brcb(row_max_blocks,alpha,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::PipeBarrier<PIPE_V>();
+                for (uint32_t col=0;col<D;col+=Fp32Repeat) {
+                    AscendC::Mul(out[col],out[col],row_max_blocks,uint64_t{Fp32Repeat},R,
+                        AscendC::BinaryRepeatParams(1,1,0,D/Fp32Block,D/Fp32Block,1));
+                }
                 if (ks>=int32_t(BN)) {
                     gm_slot=gm_slot+1==ScoreSlots ? 0 : gm_slot+1;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
@@ -204,8 +211,6 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(1);
-                Sync<AscendC::HardEvent::V_S>(pipe);
-                for(uint32_t r=0;r<R;++r) AscendC::Muls(out[r*D],out[r*D],alpha.GetValue(r),D);
                 AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(out,out,delta,R*D);
                 AscendC::CrossCoreSetFlag<0x2,PIPE_V>(TILE_DONE);
                 AscendC::PipeBarrier<PIPE_V>();
