@@ -18,10 +18,11 @@ implementation when a check fails.
 1. AIC loads Q into L1 once per query tile, streams K, and computes `Q @ K.T`
    with FP16 inputs and FP32 Cube accumulation. K is viewed column-major, so
    it needs no explicit GM transpose.
-2. Fixpipe writes each score tile to one of eight rotating GM relay slots.
+2. Fixpipe writes each score tile to one of four rotating GM relay slots.
    Both AIVs wait for the tile's slot, then each DMA-loads half the rows and
-   performs causal masking and online softmax. AIC can issue seven further QKs
-   before waiting for the current tile's probabilities.
+   performs causal masking and online softmax. AIC can issue three further QKs
+   before waiting for the current tile's probabilities. This bounds how many
+   QK writes can queue ahead of the first PV.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
    row max and sum use vector reduction APIs. The host caches packed causal
    masks in GM by device and tile shape. Each active AIV loads its mask
@@ -39,9 +40,9 @@ implementation when a check fails.
 
 This design intentionally uses **bounded GM relay transfers**. It does not
 claim all scores/probabilities stay on chip. There is no full S-by-S tensor.
-Default BM64/BN128 uses 304 KiB of relay per group, or **7.125 MiB for 24 groups**,
-independent of sequence length. BM32/BN64 uses 84 KiB per group and BM128/BN128
-uses 608 KiB. The extra score slots increase workspace capacity without
+Default BM64/BN128 uses 176 KiB of relay per group, or **4.125 MiB for 24 groups**,
+independent of sequence length. BM32/BN64 uses 52 KiB per group and BM128/BN128
+uses 352 KiB. The extra score slots increase workspace capacity without
 adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
 64/16/32/64 KiB, respectively. Source UB allocation per AIV is 84,864 bytes.
 The UB budget also leaves 8 KiB for Select's internal workspace.
