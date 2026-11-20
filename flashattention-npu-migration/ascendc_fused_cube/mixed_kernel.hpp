@@ -160,13 +160,15 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 masks[mask_offset]);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
                 auto s=score_ub[ub_slot*ScoreElements];
-                Sync<AscendC::HardEvent::V_S>(pipe);
-                for(uint32_t r=0;r<R;++r) {
-                    const float old=m.GetValue(r), block=maxA.GetValue(r);
-                    const float next=old>block?old:block;
-                    m.SetValue(r,next); alpha.SetValue(r,old-next);
-                }
-                Sync<AscendC::HardEvent::S_V>(pipe);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Max(maxA,maxA,m,R);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(alpha,m,maxA,R);
+                // Keep the updated maxima by exchanging the two UB views.
+                // The old running buffer becomes scratch for the next reduction.
+                auto previous_m=m;
+                m=maxA;
+                maxA=previous_m;
                 AscendC::Brcb(row_max_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
                 AscendC::PipeBarrier<PIPE_V>();
                 // Reuse one 32-byte max block across each 64-column repeat, then advance a row.

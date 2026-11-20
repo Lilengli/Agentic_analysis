@@ -110,10 +110,10 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const uint64_t reduce_calls = iterations * (BN == 128 ? 2 : 1);
         Require(av->whole_reduce_max_calls == reduce_calls && av->whole_reduce_sum_calls == reduce_calls,
             "AIV reduction calls do not match the score tile width");
-        Require(av->max_calls == (BN == 128 ? iterations : 0),
-            "AIV split-max combination count is incorrect");
-        Require(av->brcb_calls == iterations && av->sub_calls == iterations * (BN / 64),
-            "AIV must broadcast row maxima once and subtract once per 64-column segment");
+        Require(av->max_calls == iterations * (BN == 128 ? 2 : 1),
+            "AIV must combine the split maxima and update the running maxima as vectors");
+        Require(av->brcb_calls == iterations && av->sub_calls == iterations * (1 + BN / 64),
+            "AIV must compute the alpha exponent and subtract broadcast maxima with vector operations");
         Require(av->mul_calls == iterations && av->exp_calls == 2 * iterations,
             "AIV online-softmax vector operation counts are incorrect");
         Require(av->cast_calls == iterations + tasks,

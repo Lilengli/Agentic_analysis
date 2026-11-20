@@ -27,7 +27,8 @@ implementation when a check fails.
    masks in GM by device and tile shape. Each active AIV loads its mask
    table into UB once before waiting for the first QK tile. The
    diagonal tile applies its mask with one Tensor–Scalar Select call. Each
-   AIV broadcasts the updated row maxima with Brcb and subtracts them
+   AIV updates the running row maxima and alpha exponents with vector
+   Max/Sub, then broadcasts the updated row maxima with Brcb and subtracts them
    across all rows with one Sub call per 64-column segment.
    Exponentiated weights are cast to FP16 and sent to
    the relay; FP32 denominators use the weights before this cast.

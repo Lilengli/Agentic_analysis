@@ -102,6 +102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["aiv_score_ub_slots"]=CubeFA::UbScoreSlots;
         d["causal_mask"]="cached packed GM bitmap prefetched to UB for vector Select";
         d["score_centering"]="Brcb and strided vector Sub";
+        d["online_max_update"]="vector Max/Sub with alternating UB views";
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";
         d["primitive_library"]="CATLASS tile copies and Mmad only; no existing attention operator";
         return d;

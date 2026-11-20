@@ -446,6 +446,13 @@ inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTenso
     }
     CubeFASim::CountVector(&CubeFASim::Stats::sub_calls);
 }
+inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b, size_t n) {
+    if (n > destination.length || n > a.length || n > b.length)
+        throw std::runtime_error("mixed simulator: Sub out of bounds");
+    for (size_t i = 0; i < n; ++i)
+        destination.SetValue(i, a.GetValue(i) - b.GetValue(i));
+    CubeFASim::CountVector(&CubeFASim::Stats::sub_calls);
+}
 template <class T> void Add(LocalTensor<T> destination, LocalTensor<T> a, LocalTensor<T> b, size_t n) {
     if (n > destination.length || n > a.length || n > b.length) throw std::runtime_error("mixed simulator: Add out of bounds");
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, a.GetValue(i) + b.GetValue(i));
