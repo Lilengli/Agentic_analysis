@@ -136,7 +136,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         auto masks=maskB.template Get<uint32_t>();
         auto row_max_blocks=rowMaxBlockB.template Get<float>();
         if (group<tasks) {
-            constexpr uint32_t MaskWords=MaskWordsPerAiv(BN);
+            constexpr uint32_t MaskWords=G::CausalMaskBytes/sizeof(uint32_t);
             AscendC::GlobalTensor<uint32_t> masks_gm;
             masks_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(causal_masks)+sub*MaskWords,MaskWords);
             // Load each alignment once while the Cube starts the first QK.
