@@ -20,7 +20,7 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
     c10::OptionalDeviceGuard guard(q.device());
     auto out=at::empty_like(q);
-    const int64_t per_group=bm*bn*4+bm*bn*2+bm*128*4;
+    const int64_t per_group=CubeFA::RelayBytesFor(bm,bn);
     // Fixed-size per-group relay; independent of S. Same-stream allocator
     // lifetime is safe because raw launch is submitted before tensor release.
     auto relay=at::empty({groups*per_group},q.options().dtype(at::kByte));
@@ -67,9 +67,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["engine"]="AIC Cube + two AIV per group; QK and PV use Mmad";
         d["kernel_launches_per_call"]=1;
         d["gm_relay_bytes_per_group_bm32_bn64"]=CubeFA::Geometry<32,64>::RelayBytes;
+        d["gm_relay_bytes_per_group_bm32_bn128"]=CubeFA::Geometry<32,128>::RelayBytes;
+        d["gm_relay_bytes_per_group_bm64_bn64"]=CubeFA::Geometry<64,64>::RelayBytes;
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
-        d["gm_intermediates"]="scores FP32, probability FP16, PV FP32; bounded per-group relay";
+        d["gm_intermediates"]="two FP32 score slots, one FP16 probability slot, one FP32 PV slot per group";
+        d["qk_lookahead_tiles"]=1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";
         d["primitive_library"]="CATLASS tile copies and Mmad only; no existing attention operator";
         return d;

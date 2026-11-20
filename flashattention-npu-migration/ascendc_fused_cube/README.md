@@ -18,11 +18,13 @@ implementation when a check fails.
 1. AIC loads Q into L1 once per query tile, streams K, and computes `Q @ K.T`
    with FP16 inputs and FP32 Cube accumulation. K is viewed column-major, so
    it needs no explicit GM transpose.
-2. Fixpipe writes one score tile to a per-group relay. Both AIVs wait for it,
-   each DMA-load half the rows, apply the causal mask and online softmax.
+2. Fixpipe writes each score tile to one of two alternating GM relay slots.
+   Both AIVs wait for the tile's slot, then each DMA-loads half the rows and
+   performs causal masking and online softmax. AIC can issue the next QK
+   before waiting for the current tile's probabilities.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
    row max and sum use vector reduction APIs. Only the diagonal tile needs
-   per-element mask edits. Exponentiated weights are cast to FP16 and sent to
+   masked vector fills. Exponentiated weights are cast to FP16 and sent to
    the relay; FP32 denominators use the weights before this cast.
 4. AIC waits for both halves and computes `P @ V` using Cube, with FP32 output
    through Fixpipe. Both AIVs DMA-load their result rows and update accumulated
@@ -31,19 +33,22 @@ implementation when a check fails.
 
 This design intentionally uses **bounded GM relay transfers**. It does not
 claim all scores/probabilities stay on chip. There is no full S-by-S tensor.
-Default BM64/BN128 uses 80 KiB of relay per group, or **1.875 MiB for 24 groups**,
-independent of sequence length. BM32/BN64 uses 28 KiB per group. Max configured
-L1/L0A/L0B/L0C storage is 64/16/32/32 KiB, respectively; source UB allocation
-per AIV for BM64/BN128 is 66,432 bytes, excluding compiler overhead/spills.
+Default BM64/BN128 uses 112 KiB of relay per group, or **2.625 MiB for 24 groups**,
+independent of sequence length. BM32/BN64 uses 36 KiB per group and BM128/BN128
+uses 224 KiB. The extra score slot increases workspace capacity without
+adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
+64/16/32/32 KiB, respectively; source UB allocation per AIV is 66,432 bytes,
+excluding compiler overhead/spills.
 
-Both AIVs execute every handshake; neither exits early. The four phases are
-QK_READY (FIX), P_READY (MTE3), PV_READY (FIX), TILE_DONE (V). This serial
-schedule prioritizes validating Cube integration. It does not yet overlap
-different KV iterations or double-buffer the relay, so high MAC utilization
-and speedup are not guaranteed.
+The two score slots have separate ready flags, QK_READY and QK_NEXT_READY
+(FIX). P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) are shared across
+iterations. AIC waits for both AIVs' TILE_DONE before reusing the completed
+tile's slot and the shared probability and PV relays. The L0C buffer and
+Gemm's Fixpipe reuse barriers are unchanged. Use a device trace to check that
+the next QK is issued before the current P_READY, and measure speedup on board.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
-S divisible by BN and up to 16384; BM32/64, BN64/128, 1..24 AIC groups. No GQA,
+S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
 dropout, variable-length tails or backward.
 
 ## Build and run on the target
@@ -97,7 +102,7 @@ semantic mock. Its abstract GEMM does not simulate physical fractal conversion,
 and software flags do not validate hardware event ordering. Actual CANN/NPU
 compilation, products, repeated mixed runs and MAC counters remain necessary.
 
-Local semantic validation passed 64 cases: all four tile configurations,
+Local semantic validation passed 80 cases: all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. The maximum absolute error
 against independent FP64 causal reference was 0.00108919, within the established
 atol=.002, rtol=.01 check. Tests checked two matrix products per KV iteration,

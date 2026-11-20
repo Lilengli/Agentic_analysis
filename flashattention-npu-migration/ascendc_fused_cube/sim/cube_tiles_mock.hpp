@@ -74,7 +74,7 @@ constexpr int PIPE_MTE3 = 2;
 constexpr int PIPE_FIX = 3;
 
 namespace CubeFASim {
-constexpr unsigned kFlagCount = 4;
+constexpr unsigned kFlagCount = 5;
 constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
 

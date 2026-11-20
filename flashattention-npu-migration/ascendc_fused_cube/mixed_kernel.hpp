@@ -52,9 +52,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     kgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k),uint64_t(heads)*seq*D);
     vgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v),uint64_t(heads)*seq*D);
     ogm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output),uint64_t(heads)*seq*D);
-    sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),BM*BN);
+    // Score slots live at the start and end of the same per-group relay.
+    sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),G::RelayBytes/sizeof(float));
     pgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(relay+offset+G::SBytes),BM*BN);
     dgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset+G::SBytes+G::PBytes),BM*D);
+    constexpr uint32_t second_score=G::SecondScoreOffset/sizeof(float);
     AscendC::TPipe pipe;
     if constexpr(Core==AscendC::AIC) {
         constexpr uint32_t MaxK=BN>D?BN:D, MaxN=MaxK;
@@ -73,17 +75,25 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         for(uint32_t task=group;task<tasks;task+=groups) {
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
-            bool first=true;
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN)) {
-                Gemm(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(ks)*D],sgm,
-                    ql,bl,a0,b0,c0,BM,BN,D,Catlass::layout::RowMajor(BM,D),
-                    Catlass::layout::ColumnMajor(D,BN,D),first);
-                first=false;
-                AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+            constexpr int32_t step=BN;
+            const int32_t first_key=(qs/BN)*BN;
+            uint32_t slot=0;
+            for (int32_t qk_key=first_key, pv_key=first_key+step;
+                 pv_key>=0; qk_key-=step, pv_key-=step, slot^=1) {
+                if (qk_key>=0) {
+                    Gemm(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(qk_key)*D],sgm[slot ? second_score : 0],
+                        ql,bl,a0,b0,c0,BM,BN,D,Catlass::layout::RowMajor(BM,D),
+                        Catlass::layout::ColumnMajor(D,BN,D),qk_key==first_key);
+                    if (slot) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_NEXT_READY);
+                    else AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+                }
+                // Prime QK for the first tile, then consume PV one tile behind.
+                if (pv_key>first_key) continue;
                 AscendC::CrossCoreWaitFlag(P_READY);
-                Gemm(pipe,pgm,vgm[base+uint64_t(ks)*D],dgm,pl,bl,a0,b0,c0,
+                Gemm(pipe,pgm,vgm[base+uint64_t(pv_key)*D],dgm,pl,bl,a0,b0,c0,
                     BM,D,BN,Catlass::layout::RowMajor(BM,BN),Catlass::layout::RowMajor(BN,D));
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(PV_READY);
+                // Drain PV before reusing the consumed tile's score slot and the shared relays.
                 AscendC::CrossCoreWaitFlag(TILE_DONE);
             }
         }
@@ -107,10 +117,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::Duplicate(l,0.0f,R);
             AscendC::Duplicate(m,-3.402823466e+38F,R);
             AscendC::PipeBarrier<PIPE_V>();
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN)) {
-                AscendC::CrossCoreWaitFlag(QK_READY);
+            uint32_t slot=0;
+            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN),slot^=1) {
+                if (slot) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
+                else AscendC::CrossCoreWaitFlag(QK_READY);
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
-                AscendC::DataCopy(s,sgm[sub*R*BN],R*BN);
+                AscendC::DataCopy(s,sgm[(slot ? second_score : 0)+sub*R*BN],R*BN);
                 Sync<AscendC::HardEvent::MTE2_V>(pipe);
                 AscendC::Muls(s,s,0.08838834764831845f,R*BN);
                 AscendC::PipeBarrier<PIPE_V>();

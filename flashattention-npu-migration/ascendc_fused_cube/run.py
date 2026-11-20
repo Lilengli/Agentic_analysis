@@ -46,7 +46,8 @@ def main():
             raise RuntimeError('source changed after build; rerun python build.py')
     if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
         raise RuntimeError('loaded extension does not match build manifest')
-    print('implementation:', dict(fused_cube_ext.metadata()), flush=True)
+    implementation = dict(fused_cube_ext.metadata())
+    print('implementation:', implementation, flush=True)
     from verify_products import run_checks
     run_checks()
     shape = (a.batch, a.heads, a.seq, 128)
@@ -149,8 +150,8 @@ def main():
     result = {'shape': shape, 'dtype': 'float16', 'causal': True, 'device': torch.npu.get_device_name(0),
               'torch_version': torch.__version__, 'torch_npu_version': getattr(torch_npu,'__version__','unknown'), 'correct': True, 'checks': checks, 'query_rows_checked': indices.tolist(),
               'block_m': a.block_m, 'block_n': a.block_n, 'blocks': a.blocks,
-              'gm_relay_bytes': a.blocks*(a.block_m*a.block_n*6+a.block_m*128*4),
-              'implementation': dict(fused_cube_ext.metadata()), 'wall_ms': wall_ms, 'event_us': event_us,
+              'gm_relay_bytes': a.blocks * implementation[f'gm_relay_bytes_per_group_bm{a.block_m}_bn{a.block_n}'],
+              'implementation': implementation, 'wall_ms': wall_ms, 'event_us': event_us,
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,
               'event_median_us': statistics.median(event_us) if event_us else None,
               'profile': profile, 'note': 'Mixed Cube/Vector, bounded GM relay; event time is a stream interval; inspect CSV AIC MAC counters'}
