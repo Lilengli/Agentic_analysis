@@ -8,14 +8,17 @@
 #endif
 
 namespace CubeFA {
+__aicore__ inline uint16_t ScoreReadyFlag(uint32_t slot)
+{
+    return slot==0 ? QK_READY : QK_EXTRA_READY_BASE+slot-1;
+}
+
 template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
     AscendC::LocalTensor<float> maxB, uint32_t gm_slot, AscendC::LocalTensor<uint32_t> causal_mask)
 {
-    if (gm_slot==0) AscendC::CrossCoreWaitFlag(QK_READY);
-    else if (gm_slot==1) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
-    else AscendC::CrossCoreWaitFlag(QK_THIRD_READY);
+    AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
     AscendC::DataCopy(s,scores,Rows*BN);
     // Use distinct MTE2_V events for score and PV copies, which can both be queued.
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
@@ -92,21 +95,21 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                         BM,BN,D,Catlass::layout::RowMajor(BM,D),Catlass::layout::ColumnMajor(D,BN,D),
                         qk_key==first_key,accum_slot);
                     accum_slot^=1;
-                    if (slot==0) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
-                    else if (slot==1) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_NEXT_READY);
-                    else AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_THIRD_READY);
+                    AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(slot));
                 }
-                // Prime up to three QKs, then consume PV two tiles behind QK.
+                // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
+                // Previous P_READY freed its score slot. Allow a new QK above
+                // this wait while the AIV still consumes the previous PV relay.
+                if (pv_key<first_key) AscendC::CrossCoreWaitFlag(TILE_DONE);
                 AscendC::CrossCoreWaitFlag(P_READY);
                 Gemm<true>(pipe,pgm,vgm[base+uint64_t(pv_key)*D],dgm,pl,bl,a0,b0,
                     c0[accum_slot*L0CSlotElements],BM,D,BN,Catlass::layout::RowMajor(BM,BN),
                     Catlass::layout::RowMajor(BN,D),true,accum_slot);
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(PV_READY);
-                // Drain PV before reusing the consumed tile's score slot and the shared relays.
-                AscendC::CrossCoreWaitFlag(TILE_DONE);
             }
+            AscendC::CrossCoreWaitFlag(TILE_DONE);
         }
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);

@@ -18,9 +18,9 @@ implementation when a check fails.
 1. AIC loads Q into L1 once per query tile, streams K, and computes `Q @ K.T`
    with FP16 inputs and FP32 Cube accumulation. K is viewed column-major, so
    it needs no explicit GM transpose.
-2. Fixpipe writes each score tile to one of three rotating GM relay slots.
+2. Fixpipe writes each score tile to one of eight rotating GM relay slots.
    Both AIVs wait for the tile's slot, then each DMA-loads half the rows and
-   performs causal masking and online softmax. AIC can issue two further QKs
+   performs causal masking and online softmax. AIC can issue seven further QKs
    before waiting for the current tile's probabilities.
 3. AIVs retain FP32 maxima, denominators and output accumulators in UB. The
    row max and sum use vector reduction APIs. The host caches packed causal
@@ -38,17 +38,18 @@ implementation when a check fails.
 
 This design intentionally uses **bounded GM relay transfers**. It does not
 claim all scores/probabilities stay on chip. There is no full S-by-S tensor.
-Default BM64/BN128 uses 144 KiB of relay per group, or **3.375 MiB for 24 groups**,
-independent of sequence length. BM32/BN64 uses 44 KiB per group and BM128/BN128
-uses 288 KiB. The extra score slots increase workspace capacity without
+Default BM64/BN128 uses 304 KiB of relay per group, or **7.125 MiB for 24 groups**,
+independent of sequence length. BM32/BN64 uses 84 KiB per group and BM128/BN128
+uses 608 KiB. The extra score slots increase workspace capacity without
 adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
 64/16/32/64 KiB, respectively. Source UB allocation per AIV is 84,864 bytes.
 The UB budget also leaves 8 KiB for Select's internal workspace.
 
-The three score slots have separate ready flags, QK_READY, QK_NEXT_READY and
-QK_THIRD_READY (FIX). P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) are shared across
-iterations. AIC waits for both AIVs' TILE_DONE before reusing the completed
-tile's slot and the shared probability and PV relays. The AIC alternates two
+Each score slot has its own FIX ready flag. P_READY (MTE3), PV_READY (FIX), and
+TILE_DONE (V) are shared across iterations. P_READY releases the old score
+slot. After issuing PV, the AIC can refill that slot before both AIVs send
+TILE_DONE. TILE_DONE still gates reuse of the shared probability and PV relays.
+The AIC alternates two
 L0C slots across QK and PV products. Each slot's M_FIX event gates its copy to
 GM, and its FIX_M event gates reuse after that copy. On a device trace, compare
 the overlap of the second QK MMAD with the first QK FIX copy and the gap between
@@ -116,7 +117,8 @@ compilation, products, repeated mixed runs and MAC counters remain necessary.
 
 The semantic suite covers all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. It also checks S512 with
-BM128/BN128, including three outstanding QKs and score-slot reuse. The maximum absolute error
+BM128/BN128 and S640 with BM32/BN64, including a full score ring and wraparound.
+It checks that the AIC refills the ring before waiting for TILE_DONE. The maximum absolute error
 against independent FP64 causal reference was 0.00108919, within the established
 atol=.002, rtol=.01 check. Tests checked two matrix products per KV iteration,
 both-AIV flag participation, repeated relay reuse, bounds/alignment, and UB

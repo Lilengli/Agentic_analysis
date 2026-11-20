@@ -96,7 +96,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_relay_bytes_per_group_bm64_bn64"]=CubeFA::Geometry<64,64>::RelayBytes;
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
-        d["gm_intermediates"]="three FP32 score slots, one FP16 probability slot, one FP32 PV slot per group";
+        d["gm_intermediates"]="FP32 score ring, one FP16 probability slot, one FP32 PV slot per group";
+        d["gm_score_slots"]=CubeFA::ScoreSlots;
         d["qk_lookahead_tiles"]=CubeFA::QkLookaheadTiles;
         d["aiv_score_ub_slots"]=CubeFA::UbScoreSlots;
         d["causal_mask"]="cached packed GM bitmap prefetched to UB for vector Select";

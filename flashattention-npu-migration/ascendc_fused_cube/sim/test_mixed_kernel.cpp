@@ -55,19 +55,24 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     const uint64_t tasks = AssignedTasks(group, groups, uint64_t(heads) * (seq / BM));
     const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending{};
+    std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending_before_done{};
     std::vector<uint64_t> expected_prepared_at_pv_wait;
     const uint32_t query_tiles = seq / BM;
     uint64_t prepared = 0;
     for (uint64_t task = group; task < uint64_t(heads) * query_tiles; task += groups) {
         const uint32_t kv_tiles = uint32_t(task % query_tiles) * BM / BN + 1;
-        for (uint32_t remaining = kv_tiles; remaining > 0; --remaining)
+        for (uint32_t remaining = kv_tiles; remaining > 0; --remaining) {
             ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
+            ++expected_pending_before_done[std::min(remaining - 1, CubeFA::ScoreSlots)];
+        }
         for (uint32_t tile = 0; tile < kv_tiles; ++tile)
             expected_prepared_at_pv_wait.push_back(prepared + std::min(tile + 2, kv_tiles));
         prepared += kv_tiles;
     }
     Require(aic.pending_qk_at_p_waits == expected_pending,
         "AIC did not fill the expected score slots before waiting for P");
+    Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
+        "AIC did not refill the score ring before waiting for TILE_DONE");
     Require(aic.mmad_calls == 2 * iterations,
         "AIC group " + std::to_string(group) + " did not issue exactly two Mmad products per KV tile");
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
@@ -256,6 +261,7 @@ int main(int argc, char** argv) {
         CheckShape<64, 128>();
         CheckShape<128, 128>();
         Check<128, 128>(512, 1, 3, 0);
+        Check<32, 64>(640, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
