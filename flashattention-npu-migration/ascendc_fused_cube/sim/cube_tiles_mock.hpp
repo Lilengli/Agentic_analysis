@@ -81,6 +81,11 @@ constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
 
 struct Stats {
+    struct PvWaitSnapshot {
+        uint64_t gm_read_elements;
+        uint64_t whole_reduce_max_calls;
+    };
+
     uint64_t gm_read_elements = 0;
     uint64_t gm_write_elements = 0;
     uint64_t mmad_calls = 0;
@@ -95,6 +100,7 @@ struct Stats {
     uint64_t cast_calls = 0;
     uint64_t duplicate_calls = 0;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
+    std::vector<PvWaitSnapshot> pv_waits;
     std::array<size_t, 5> local_bytes_by_position{};
 };
 
@@ -176,6 +182,10 @@ inline void WaitFlag(uint32_t flag) {
     FlagState& state = GroupFlags(context.group);
     std::unique_lock<std::mutex> lock(state.mutex);
     if (context.core == Core::AIV) {
+        if (flag == CubeFA::PV_READY && context.stats) {
+            auto& stats = *context.stats;
+            stats.pv_waits.push_back({stats.gm_read_elements, stats.whole_reduce_max_calls});
+        }
         const uint64_t target = context.seen_broadcasts[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
                 return state.aborted || state.broadcasts[flag] >= target;

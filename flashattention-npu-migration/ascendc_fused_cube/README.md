@@ -37,7 +37,7 @@ Default BM64/BN128 uses 144 KiB of relay per group, or **3.375 MiB for 24 groups
 independent of sequence length. BM32/BN64 uses 44 KiB per group and BM128/BN128
 uses 288 KiB. The extra score slots increase workspace capacity without
 adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
-64/16/32/64 KiB, respectively; source UB allocation per AIV is 66,432 bytes,
+64/16/32/64 KiB, respectively; source UB allocation per AIV is 82,816 bytes,
 excluding compiler overhead/spills.
 
 The three score slots have separate ready flags, QK_READY, QK_NEXT_READY and
@@ -48,6 +48,11 @@ L0C slots across QK and PV products. Each slot's M_FIX event gates its copy to
 GM, and its FIX_M event gates reuse after that copy. On a device trace, compare
 the overlap of the second QK MMAD with the first QK FIX copy and the gap between
 those two FIX copies. Measure end-to-end performance on board.
+
+Each AIV alternates two score buffers in UB. After queuing a tile's P store
+and before waiting for its PV result, it loads the next score tile, scales
+it and computes its row maxima. The current output update still uses its own
+alpha, and the next tile consumes its prepared scores after TILE_DONE.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
 S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
@@ -132,7 +137,7 @@ physical HBM traffic. For S=16384, batch*heads=2 it predicts 7240 MiB total for
 
 The 128x128 shape requires CANN compilation and independent device correctness
 and performance validation. The default remains 64x128. Each AIV uses about
-132864 bytes of UB and AIC uses two 64 KiB L0C slots. CPU simulation cannot validate
+165632 bytes of UB and AIC uses two 64 KiB L0C slots. CPU simulation cannot validate
 device lowering, hardware buffer limits, event synchronization or performance.
 
 ```

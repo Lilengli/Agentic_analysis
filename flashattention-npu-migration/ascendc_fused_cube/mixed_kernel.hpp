@@ -37,6 +37,32 @@ __aicore__ inline void MaskFutureScores(AscendC::LocalTensor<float> scores, uint
     }
 }
 
+template<uint32_t Rows,uint32_t BN>
+__aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
+    AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
+    AscendC::LocalTensor<float> maxB, uint32_t gm_slot, uint32_t first_visible)
+{
+    if (gm_slot==0) AscendC::CrossCoreWaitFlag(QK_READY);
+    else if (gm_slot==1) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
+    else AscendC::CrossCoreWaitFlag(QK_THIRD_READY);
+    AscendC::DataCopy(s,scores,Rows*BN);
+    // Use distinct MTE2_V events for score and PV copies, which can both be queued.
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    AscendC::Muls(s,s,0.08838834764831845f,Rows*BN);
+    AscendC::PipeBarrier<PIPE_V>();
+    if (first_visible<BN) {
+        MaskFutureScores<Rows,BN>(s,first_visible);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    AscendC::WholeReduceMax(maxA,s,64,Rows,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+    if constexpr(BN==128) {
+        AscendC::WholeReduceMax(maxB,s[64],64,Rows,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Max(maxA,maxA,maxB,Rows);
+    }
+}
+
 template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,uint32_t heads,uint32_t seq,uint32_t groups)
@@ -114,13 +140,15 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
     } else {
         constexpr uint32_t R=G::Rows;
+        constexpr uint32_t ScoreElements=R*BN;
+        static_assert(G::UbBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB;
-        pipe.InitBuffer(sB,R*BN*4); pipe.InitBuffer(pB,R*BN*2);
+        pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float)); pipe.InitBuffer(pB,R*BN*2);
         pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);
-        auto s=sB.template Get<float>(); auto p=pB.template Get<half>();
+        auto score_ub=sB.template Get<float>(); auto p=pB.template Get<half>();
         auto delta=dB.template Get<float>(); auto out=oB.template Get<float>(); auto oh=ohB.template Get<half>();
         auto m=mB.template Get<float>(); auto l=lB.template Get<float>(); auto alpha=alphaB.template Get<float>();
         auto maxA=maxAB.template Get<float>(); auto maxB=maxBB.template Get<float>();
@@ -132,27 +160,14 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::Duplicate(l,0.0f,R);
             AscendC::Duplicate(m,-3.402823466e+38F,R);
             AscendC::PipeBarrier<PIPE_V>();
-            uint32_t slot=0;
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN),slot=slot+1==ScoreSlots ? 0 : slot+1) {
-                if (slot==0) AscendC::CrossCoreWaitFlag(QK_READY);
-                else if (slot==1) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
-                else AscendC::CrossCoreWaitFlag(QK_THIRD_READY);
-                const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
-                Sync<AscendC::HardEvent::V_MTE2>(pipe);
-                AscendC::DataCopy(s,sgm[score_offset+sub*R*BN],R*BN);
-                Sync<AscendC::HardEvent::MTE2_V>(pipe);
-                AscendC::Muls(s,s,0.08838834764831845f,R*BN);
-                AscendC::PipeBarrier<PIPE_V>();
-                if(uint32_t(ks)==(qs/BN)*BN) {
-                    MaskFutureScores<R,BN>(s, qs+sub*R-uint32_t(ks)+1);
-                    AscendC::PipeBarrier<PIPE_V>();
-                }
-                AscendC::WholeReduceMax(maxA,s,64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-                if constexpr(BN==128) {
-                    AscendC::WholeReduceMax(maxB,s[64],64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Max(maxA,maxA,maxB,R);
-                }
+            const int32_t first_key=(qs/BN)*BN;
+            const uint32_t score_row_offset=sub*ScoreElements;
+            uint32_t gm_slot=0, ub_slot=0;
+            Sync<AscendC::HardEvent::V_MTE2>(pipe);
+            PrepareScoreTile<R,BN>(score_ub,sgm[score_row_offset],maxA,maxB,gm_slot,
+                qs+sub*R-uint32_t(first_key)+1);
+            for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
+                auto s=score_ub[ub_slot*ScoreElements];
                 Sync<AscendC::HardEvent::V_S>(pipe);
                 for(uint32_t r=0;r<R;++r) {
                     const float old=m.GetValue(r), block=maxA.GetValue(r);
@@ -175,10 +190,20 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 Sync<AscendC::HardEvent::V_MTE3>(pipe);
                 AscendC::DataCopy(pgm[sub*R*BN],p,R*BN);
                 AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(P_READY);
-                AscendC::CrossCoreWaitFlag(PV_READY);
+                // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
+                if (ks>=int32_t(BN)) {
+                    gm_slot=gm_slot+1==ScoreSlots ? 0 : gm_slot+1;
+                    const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
+                    // QK for the next tile is issued before AIC waits for this P_READY.
+                    // Only score-local math runs here, so alpha remains valid for this PV.
+                    PrepareScoreTile<R,BN>(score_ub[(ub_slot^1)*ScoreElements],
+                        sgm[next_score_offset+score_row_offset],maxA,maxB,gm_slot,BN);
+                }
+                AscendC::CrossCoreWaitFlag(PV_READY);
                 AscendC::DataCopy(delta,dgm[sub*R*D],R*D);
-                Sync<AscendC::HardEvent::MTE2_V>(pipe);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(1);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(1);
                 Sync<AscendC::HardEvent::V_S>(pipe);
                 for(uint32_t r=0;r<R;++r) AscendC::Muls(out[r*D],out[r*D],alpha.GetValue(r),D);
                 AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(out,out,delta,R*D);

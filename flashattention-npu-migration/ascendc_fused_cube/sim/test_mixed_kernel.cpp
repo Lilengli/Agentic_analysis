@@ -55,11 +55,16 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     const uint64_t tasks = AssignedTasks(group, groups, uint64_t(heads) * (seq / BM));
     const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending{};
+    std::vector<uint64_t> expected_prepared_at_pv_wait;
     const uint32_t query_tiles = seq / BM;
+    uint64_t prepared = 0;
     for (uint64_t task = group; task < uint64_t(heads) * query_tiles; task += groups) {
         const uint32_t kv_tiles = uint32_t(task % query_tiles) * BM / BN + 1;
         for (uint32_t remaining = kv_tiles; remaining > 0; --remaining)
             ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
+        for (uint32_t tile = 0; tile < kv_tiles; ++tile)
+            expected_prepared_at_pv_wait.push_back(prepared + std::min(tile + 2, kv_tiles));
+        prepared += kv_tiles;
     }
     Require(aic.pending_qk_at_p_waits == expected_pending,
         "AIC did not fill the expected score slots before waiting for P");
@@ -80,6 +85,16 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
         Require(av->local_bytes_by_position[unsigned(AscendC::TPosition::VECCALC)] == G::UbBytes,
             "AIV UB buffers exceed or differ from Geometry::UbBytes");
+        Require(av->pv_waits.size() == expected_prepared_at_pv_wait.size(),
+            "AIV PV wait count does not match the number of KV tiles");
+        for (size_t i = 0; i < av->pv_waits.size(); ++i) {
+            const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
+            const auto& snapshot = av->pv_waits[i];
+            Require(snapshot.gm_read_elements == (scores_prepared * BN + i * CubeFA::D) * R,
+                "AIV did not prefetch the next score before waiting for PV");
+            Require(snapshot.whole_reduce_max_calls == scores_prepared * (BN == 128 ? 2 : 1),
+                "AIV did not reduce the next score before waiting for PV");
+        }
         Require(av->gm_read_elements == iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
             "AIV score/delta GM read count is incorrect");
         Require(av->gm_write_elements == iterations * uint64_t(R) * BN + tasks * uint64_t(R) * CubeFA::D,
