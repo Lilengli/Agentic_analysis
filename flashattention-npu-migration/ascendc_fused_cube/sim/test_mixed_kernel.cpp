@@ -104,8 +104,8 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV reduction calls do not match the score tile width");
         Require(av->max_calls == (BN == 128 ? iterations : 0),
             "AIV split-max combination count is incorrect");
-        Require(av->adds_calls == iterations * R,
-            "AIV per-row score shift count is incorrect");
+        Require(av->brcb_calls == iterations && av->sub_calls == iterations * (BN / 64),
+            "AIV must broadcast row maxima once and subtract once per 64-column segment");
         Require(av->mul_calls == iterations && av->exp_calls == 2 * iterations,
             "AIV online-softmax vector operation counts are incorrect");
         Require(av->cast_calls == iterations + tasks,

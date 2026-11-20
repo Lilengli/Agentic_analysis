@@ -132,20 +132,25 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     } else {
         constexpr uint32_t R=G::Rows;
         constexpr uint32_t ScoreElements=R*BN;
+        constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
+        static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0);
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
         pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float)); pipe.InitBuffer(pB,R*BN*2);
         pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);
         pipe.InitBuffer(maskB,G::CausalMaskBytes);
+        pipe.InitBuffer(rowMaxBlockB,G::BroadcastBytes);
         auto score_ub=sB.template Get<float>(); auto p=pB.template Get<half>();
         auto delta=dB.template Get<float>(); auto out=oB.template Get<float>(); auto oh=ohB.template Get<half>();
         auto m=mB.template Get<float>(); auto l=lB.template Get<float>(); auto alpha=alphaB.template Get<float>();
         auto maxA=maxAB.template Get<float>(); auto maxB=maxBB.template Get<float>();
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
         auto masks=maskB.template Get<uint32_t>();
+        auto row_max_blocks=rowMaxBlockB.template Get<float>();
         // Each alignment repeats across sequence blocks and heads.
         InitCausalMasks<BM,BN>(masks,sub);
         Sync<AscendC::HardEvent::S_V>(pipe);
@@ -170,9 +175,15 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     const float old=m.GetValue(r), block=maxA.GetValue(r);
                     const float next=old>block?old:block;
                     m.SetValue(r,next); alpha.SetValue(r,old-next);
-                    AscendC::Adds(s[r*BN],s[r*BN],-next,BN);
                 }
                 Sync<AscendC::HardEvent::S_V>(pipe);
+                AscendC::Brcb(row_max_blocks,m,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::PipeBarrier<PIPE_V>();
+                // Reuse one 32-byte max block across each 64-column repeat, then advance a row.
+                for (uint32_t col=0;col<BN;col+=Fp32Repeat) {
+                    AscendC::Sub(s[col],s[col],row_max_blocks,uint64_t{Fp32Repeat},R,
+                        AscendC::BinaryRepeatParams(1,1,0,BN/Fp32Block,BN/Fp32Block,1));
+                }
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
                 AscendC::PipeBarrier<PIPE_V>();

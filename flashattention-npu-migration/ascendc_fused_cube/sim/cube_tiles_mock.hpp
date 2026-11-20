@@ -92,7 +92,8 @@ struct Stats {
     uint64_t whole_reduce_max_calls = 0;
     uint64_t whole_reduce_sum_calls = 0;
     uint64_t max_calls = 0;
-    uint64_t adds_calls = 0;
+    uint64_t brcb_calls = 0;
+    uint64_t sub_calls = 0;
     uint64_t add_calls = 0;
     uint64_t mul_calls = 0;
     uint64_t muls_calls = 0;
@@ -400,10 +401,43 @@ template <class T> void Max(LocalTensor<T> destination, LocalTensor<T> a, LocalT
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, std::max(a.GetValue(i), b.GetValue(i)));
     CubeFASim::CountVector(&CubeFASim::Stats::max_calls);
 }
-template <class T> void Adds(LocalTensor<T> destination, LocalTensor<T> source, T scalar, size_t n) {
-    if (n > destination.length || n > source.length) throw std::runtime_error("mixed simulator: Adds out of bounds");
-    for (size_t i = 0; i < n; ++i) destination.SetValue(i, source.GetValue(i) + scalar);
-    CubeFASim::CountVector(&CubeFASim::Stats::adds_calls);
+struct BrcbRepeatParams {
+    int block_stride, repeat_stride;
+    BrcbRepeatParams(int block, int repeat) : block_stride(block), repeat_stride(repeat) {}
+};
+
+inline void Brcb(LocalTensor<float> destination, LocalTensor<float> source,
+        uint8_t repeats, const BrcbRepeatParams& params) {
+    constexpr size_t block = 32 / sizeof(float);
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        for (size_t row = 0; row < 8; ++row) {
+            const float value = source.GetValue(repeat * 8 + row);
+            const size_t offset = (repeat * params.repeat_stride + row * params.block_stride) * block;
+            for (size_t lane = 0; lane < block; ++lane) destination.SetValue(offset + lane, value);
+        }
+    }
+    CubeFASim::CountVector(&CubeFASim::Stats::brcb_calls);
+}
+
+struct BinaryRepeatParams {
+    std::array<int, 3> block_stride, repeat_stride;
+    BinaryRepeatParams(int db, int ab, int bb, int dr, int ar, int br)
+        : block_stride{db, ab, bb}, repeat_stride{dr, ar, br} {}
+};
+
+inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    constexpr size_t block = 32 / sizeof(float);
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        for (size_t lane = 0; lane < mask; ++lane) {
+            const auto offset = [&](size_t operand) {
+                return (repeat * params.repeat_stride[operand] + lane / block *
+                    params.block_stride[operand]) * block + lane % block;
+            };
+            destination.SetValue(offset(0), a.GetValue(offset(1)) - b.GetValue(offset(2)));
+        }
+    }
+    CubeFASim::CountVector(&CubeFASim::Stats::sub_calls);
 }
 template <class T> void Add(LocalTensor<T> destination, LocalTensor<T> a, LocalTensor<T> b, size_t n) {
     if (n > destination.length || n > a.length || n > b.length) throw std::runtime_error("mixed simulator: Add out of bounds");

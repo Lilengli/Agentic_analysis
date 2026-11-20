@@ -75,6 +75,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["qk_lookahead_tiles"]=CubeFA::QkLookaheadTiles;
         d["aiv_score_ub_slots"]=CubeFA::UbScoreSlots;
         d["causal_mask"]="packed UB bitmap with vector Select";
+        d["score_centering"]="Brcb and strided vector Sub";
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";
         d["primitive_library"]="CATLASS tile copies and Mmad only; no existing attention operator";
         return d;

@@ -21,8 +21,9 @@ template<uint32_t BM,uint32_t BN> struct Geometry {
     static constexpr uint32_t RelayBytes=RelayBytesFor(BM,BN);
     static constexpr uint32_t CausalMaskWords=Rows*BN/32;
     static constexpr uint32_t CausalMaskBytes=(BN/BM)*CausalMaskWords*sizeof(uint32_t);
+    static constexpr uint32_t BroadcastBytes=Rows*32;
     static constexpr uint32_t UbBytes=UbScoreSlots*Rows*BN*4+Rows*BN*2+2*Rows*D*4+Rows*D*2+7*Rows*4
-        +CausalMaskBytes;
+        +CausalMaskBytes+BroadcastBytes;
 };
 constexpr uint16_t QK_READY=0, P_READY=1, PV_READY=2, TILE_DONE=3, QK_NEXT_READY=4, QK_THIRD_READY=5;
 } // namespace CubeFA
