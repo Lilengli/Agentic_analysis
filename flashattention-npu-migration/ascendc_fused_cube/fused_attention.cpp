@@ -29,8 +29,7 @@ at::Tensor GetCausalMask(c10::Device device,int64_t bm,int64_t bn)
 } // namespace
 
 at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
-    int64_t bm=64,int64_t bn=128,int64_t groups=24,bool pv_row32=false,bool pv_row32_batch_fix=false,
-    bool prioritize_p_writeback=false,bool defer_qk_fixpipe=false)
+    int64_t bm=64,int64_t bn=128,int64_t groups=24)
 {
     TORCH_CHECK(q.device().type()==c10::DeviceType::PrivateUse1 && q.device()==k.device() && q.device()==v.device(),"same NPU required");
     TORCH_CHECK(q.dim()==4 && q.sizes()==k.sizes() && q.sizes()==v.sizes(),"matching BNSD tensors required");
@@ -40,12 +39,6 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn) ||
         (bm==128 && bn==512),"BM32/64/128 BN64/128 with BM<=BN, or experimental BM128/BN512 required");
     TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 && q.size(2)%bn==0 && q.size(3)==128,"S<=16384 divisible by BN and D128 required");
-    TORCH_CHECK(!pv_row32_batch_fix || pv_row32,"pv_row32_batch_fix requires pv_row32");
-    TORCH_CHECK(!pv_row32 || (bm==128 && bn==512),"pv_row32 requires BM128/BN512");
-    TORCH_CHECK(!prioritize_p_writeback || (bm==128 && bn==512 && !pv_row32),
-        "prioritize_p_writeback requires BM128/BN512 without row32 PV");
-    TORCH_CHECK(!defer_qk_fixpipe || (bm==128 && bn==512 && !pv_row32 && !prioritize_p_writeback),
-        "defer_qk_fixpipe requires BM128/BN512 without other PV scheduling experiments");
     TORCH_CHECK(groups>0 && groups<=24,"groups must be 1..24");
     const int64_t heads=q.size(0)*q.size(1);
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
@@ -70,10 +63,6 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==128 && bn==128) CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(defer_qk_fixpipe) CubeFA::fused_cube_attention<128,512,false,false,false,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(prioritize_p_writeback) CubeFA::fused_cube_attention<128,512,false,false,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(pv_row32_batch_fix) CubeFA::fused_cube_attention<128,512,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(pv_row32) CubeFA::fused_cube_attention<128,512,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else CubeFA::fused_cube_attention<128,512><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     return out;
 }
@@ -99,9 +88,7 @@ at::Tensor product(const at::Tensor& a,const at::Tensor& b,bool transpose_b) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
     m.def("product",&product,pybind11::arg("a"),pybind11::arg("b"),pybind11::arg("transpose_b")=false);
     m.def("forward",&forward,pybind11::arg("q"),pybind11::arg("k"),pybind11::arg("v"),
-        pybind11::arg("block_m")=64,pybind11::arg("block_n")=128,pybind11::arg("blocks")=24,pybind11::arg("pv_row32")=false,
-        pybind11::arg("pv_row32_batch_fix")=false,pybind11::arg("prioritize_p_writeback")=false,
-        pybind11::arg("defer_qk_fixpipe")=false);
+        pybind11::arg("block_m")=64,pybind11::arg("block_n")=128,pybind11::arg("blocks")=24);
     m.def("metadata",[](){
         pybind11::dict d;
         d["engine"]="AIC Cube + two AIV per group; QK and PV use Mmad";
@@ -125,8 +112,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["stack512_score_row_reductions"]="three-stage BlockReduceMax and BlockReduceSum";
         d["stack512_vector_batch_rows"]=CubeFA::Geometry<128,512>::BatchRows;
         d["stack512_cube_kv_per_mmad"]=CubeFA::Geometry<128,512>::CubeKv;
-        d["experimental_pv_row32"]="P[32,512] x V[512,32], V double-buffered in L0B";
-        d["experimental_pv_row32_batch_fix_calls"]=4;
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=CubeFA::PvRelaySlots-1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";

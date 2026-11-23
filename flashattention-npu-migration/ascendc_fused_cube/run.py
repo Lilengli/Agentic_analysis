@@ -22,14 +22,6 @@ def main():
     p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
     p.add_argument('--block-n', type=int, choices=(64, 128, 512), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
-    pv = p.add_mutually_exclusive_group()
-    pv.add_argument('--pv-row32', action='store_true', help='early PV with per-tile Fixpipe')
-    pv.add_argument('--pv-row32-batch-fix', action='store_true',
-                    help='early PV with one Fixpipe per 32 output rows')
-    pv.add_argument('--prioritize-p-writeback', action='store_true',
-                    help='for BM128/BN512, wait for the oldest P before refilling the QK queue')
-    pv.add_argument('--defer-qk-fixpipe', action='store_true',
-                    help='compute two QK slices before P_READY and delay their score stores')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
     p.add_argument('--warmup', type=int, default=1)
@@ -46,13 +38,6 @@ def main():
             and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
                 'or experimental BM128/BN512; S must be divisible by BN, groups 1..24, counts positive')
-    pv_row32 = a.pv_row32 or a.pv_row32_batch_fix
-    if pv_row32 and (a.block_m, a.block_n) != (128, 512):
-        p.error('row32 PV modes require --block-m 128 --block-n 512')
-    if a.prioritize_p_writeback and (a.block_m, a.block_n) != (128, 512):
-        p.error('--prioritize-p-writeback requires --block-m 128 --block-n 512')
-    if a.defer_qk_fixpipe and (a.block_m, a.block_n) != (128, 512):
-        p.error('--defer-qk-fixpipe requires --block-m 128 --block-n 512')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
@@ -66,14 +51,6 @@ def main():
     if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
         raise RuntimeError('loaded extension does not match build manifest')
     implementation = dict(fused_cube_ext.metadata())
-    if a.prioritize_p_writeback:
-        implementation['qk_lookahead_tiles'] = 2
-        implementation['qk_refill_order'] = 'after oldest P_READY and PV'
-    if a.defer_qk_fixpipe:
-        implementation['qk_lookahead_tiles'] = 2
-        implementation['qk_primed_stacks'] = 2
-        implementation['qk_slices_staged_before_p_ready'] = 2
-        implementation['qk_refill_order'] = 'stage two QK slices, wait P_READY, finish QK stores, submit PV'
     print('implementation:', implementation, flush=True)
     from verify_products import run_checks
     run_checks()
@@ -82,8 +59,7 @@ def main():
     checks = []
 
     def call():
-        return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks,
-                                      pv_row32, a.pv_row32_batch_fix, a.prioritize_p_writeback, a.defer_qk_fixpipe)
+        return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks)
 
     def verify(out, label):
         # Copy only sampled outputs for CPU FP32 comparison. All values in all
@@ -178,9 +154,6 @@ def main():
     result = {'shape': shape, 'dtype': 'float16', 'causal': True, 'device': torch.npu.get_device_name(0),
               'torch_version': torch.__version__, 'torch_npu_version': getattr(torch_npu,'__version__','unknown'), 'correct': True, 'checks': checks, 'query_rows_checked': indices.tolist(),
               'block_m': a.block_m, 'block_n': a.block_n, 'blocks': a.blocks,
-              'pv_row32': pv_row32, 'pv_row32_batch_fix': a.pv_row32_batch_fix,
-              'prioritize_p_writeback': a.prioritize_p_writeback,
-              'defer_qk_fixpipe': a.defer_qk_fixpipe,
               'gm_relay_bytes': a.blocks * implementation[f'gm_relay_bytes_per_group_bm{a.block_m}_bn{a.block_n}'],
               'implementation': implementation, 'wall_ms': wall_ms, 'event_us': event_us,
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,

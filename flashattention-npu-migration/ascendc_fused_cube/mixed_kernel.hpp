@@ -141,7 +141,7 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
 }
 
-template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask,bool PvRow32=false>
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
 __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC::GlobalTensor<half> pgm,
     AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p, AscendC::LocalTensor<half> alternate_p,
     AscendC::LocalTensor<float> partial0, AscendC::LocalTensor<float> partial1,
@@ -188,13 +188,6 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
             Sync<AscendC::HardEvent::V_MTE3>(pipe);
             AscendC::DataCopy(pgm[(pv_slot*2+sub)*Rows*BN+batch*Elements],batch_p,Elements);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(slot);
-            if constexpr(PvRow32) {
-                static_assert(2*BatchRows==PvRowTile && Rows==2*PvRowTile);
-                // Pulse the slot's P_READY after each 32-row tranche. Both AIVs
-                // publish in the same order; the Cube consumes exactly two pulses.
-                if(row+BatchRows==PvRowTile)
-                    AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(RelayFlag(P_READY,pv_slot));
-            }
         }
         // Each row slice wrote to the alternate running-max buffer.
         auto previous_m=m;
@@ -206,35 +199,11 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<uint32_t BM,uint32_t BN>
-__aicore__ inline void EmitQkStack(AscendC::TPipe& pipe,
-    AscendC::GlobalTensor<half> q,AscendC::GlobalTensor<half> k,
-    AscendC::GlobalTensor<float> score,AscendC::LocalTensor<half> ql,
-    AscendC::LocalTensor<half> bl,AscendC::LocalTensor<half> a0,
-    AscendC::LocalTensor<half> b0,AscendC::LocalTensor<float> c0,
-    int32_t& accum_slot,uint32_t score_slot,bool load_q,uint32_t first_kv=0)
-{
-    constexpr uint32_t CubeKv=Geometry<BM,BN>::CubeKv;
-    constexpr uint32_t L0CStride=BM*(CubeKv>D ? CubeKv : D);
-    for(uint32_t kv=first_kv;kv<BN;kv+=CubeKv) {
-        Gemm<true>(pipe,q,k[kv*D],score[kv],ql,bl,a0,b0,c0[accum_slot*L0CStride],
-            BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
-            Catlass::layout::ColumnMajor(D,CubeKv,D),load_q && kv==0,
-            accum_slot,BN);
-        accum_slot^=1;
-    }
-    AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(score_slot));
-}
-
-template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false,bool PrioritizeP=false,bool DeferQkFixpipe=false>
+template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
-    static_assert(!PvRow32 || (BM==128 && BN==PvFullKv));
-    static_assert(!BatchFix || PvRow32);
-    static_assert(!PrioritizeP || (BM==128 && BN==512 && !PvRow32));
-    static_assert(!DeferQkFixpipe || (BM==128 && BN==512 && !PvRow32 && !PrioritizeP));
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -262,16 +231,10 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         AscendC::TBuf<AscendC::TPosition::B2> b0B;
         AscendC::TBuf<AscendC::TPosition::CO1> c0B;
         pipe.InitBuffer(qB,BM*D*sizeof(half));
-        constexpr uint32_t L1P=PvRow32 ? 2*PvRowTile*BN : BM*CubeKv;
-        constexpr uint32_t L1B=PvRow32 ? BN*D : CubeKv*D;
-        constexpr uint32_t L0A=PvRow32 ? 2*PvRowTile*BN : BM*MaxK;
-        constexpr uint32_t L0B=PvRow32 ? PvBSlots*BN*PvFeatureTile : CubeKv*D;
-        static_assert((BM*D+L1P+L1B)*sizeof(half)<=512*1024);
-        static_assert(L0A*sizeof(half)<=64*1024 && L0B*sizeof(half)<=64*1024);
-        pipe.InitBuffer(pB,L1P*sizeof(half));
-        pipe.InitBuffer(bB,L1B*sizeof(half));
-        pipe.InitBuffer(a0B,L0A*sizeof(half));
-        pipe.InitBuffer(b0B,L0B*sizeof(half));
+        pipe.InitBuffer(pB,BM*CubeKv*sizeof(half));
+        pipe.InitBuffer(bB,CubeKv*D*sizeof(half));
+        pipe.InitBuffer(a0B,BM*MaxK*sizeof(half));
+        pipe.InitBuffer(b0B,CubeKv*D*sizeof(half));
         pipe.InitBuffer(c0B,2*L0CSlotElements*sizeof(float));
         auto ql=qB.template Get<half>(); auto pl=pB.template Get<half>(); auto bl=bB.template Get<half>();
         auto a0=a0B.template Get<half>(); auto b0=b0B.template Get<half>(); auto c0=c0B.template Get<float>();
@@ -285,94 +248,36 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint64_t base=uint64_t(head)*seq*D;
             constexpr int32_t step=BN;
             const int32_t first_key=(qs/BN)*BN;
-            // Keep two stacks in front of PV, then wait for the oldest P
-            // before submitting any newer score writeback on this group.
-            constexpr int32_t QkLead=(PrioritizeP || DeferQkFixpipe) ? 2 : QkLookaheadTiles;
             uint32_t slot=0, issued_pv=0;
-            for (int32_t qk_key=first_key, pv_key=first_key+QkLead*step;
+            for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
-                const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
-                if(qk_key>=0 && (!(PrioritizeP || DeferQkFixpipe) || pv_key>first_key)) {
-                    EmitQkStack<BM,BN>(pipe,qgm[base+uint64_t(qs)*D],
-                        kgm[base+uint64_t(qk_key)*D],sgm[score_offset],
-                        ql,bl,a0,b0,c0,accum_slot,slot,qk_key==first_key);
+                if (qk_key>=0) {
+                    const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
+                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                        Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+(uint64_t(qk_key)+kv)*D],
+                            sgm[score_offset+kv],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                            BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
+                            Catlass::layout::ColumnMajor(D,CubeKv,D),qk_key==first_key && kv==0,
+                            accum_slot,BN);
+                        accum_slot^=1;
+                    }
+                    AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(slot));
                 }
                 // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
                 const uint32_t pv_slot=issued_pv%PvRelaySlots;
                 if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
-                if constexpr(DeferQkFixpipe) {
-                    // Stage two fresh QK slices, one per L0C slot. The slots
-                    // remain owned by Cube until their stores are issued.
-                    if(qk_key>=0) {
-                        for(uint32_t slice=0;slice<2;++slice) {
-                            const uint32_t kv=slice*CubeKv;
-                            const int32_t held_slot=accum_slot ^ static_cast<int32_t>(slice);
-                            Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],
-                                kgm[base+(uint64_t(qk_key)+kv)*D],sgm[score_offset+kv],
-                                ql,bl,a0,b0,c0[held_slot*L0CSlotElements],BM,CubeKv,D,
-                                Catlass::layout::RowMajor(BM,D),
-                                Catlass::layout::ColumnMajor(D,CubeKv,D),
-                                false,held_slot,BN,true,false);
-                        }
-                    }
-                }
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                if constexpr(DeferQkFixpipe) {
-                    if(qk_key>=0) {
-                        for(uint32_t slice=0;slice<2;++slice) {
-                            const int32_t held_slot=accum_slot ^ static_cast<int32_t>(slice);
-                            StoreQkSlice<BM,CubeKv,BN>(sgm[score_offset+slice*CubeKv],
-                                c0[held_slot*L0CSlotElements],held_slot);
-                        }
-                        EmitQkStack<BM,BN>(pipe,qgm[base+uint64_t(qs)*D],
-                            kgm[base+uint64_t(qk_key)*D],sgm[score_offset],
-                            ql,bl,a0,b0,c0,accum_slot,slot,false,2*CubeKv);
-                    }
+                // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
+                for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                    Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
+                        dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                        BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
+                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
                 }
-                if constexpr(PvRow32) {
-                    auto pv=vgm[base+uint64_t(pv_key)*D];
-                    auto pslot=pgm[pv_slot*BM*BN];
-                    auto dslot=dgm[pv_slot*BM*D];
-                    if constexpr(BatchFix) {
-                        constexpr uint32_t Stripe=PvBatchFixLayout::StripeElements;
-                        static_assert(4*Stripe==L0CSlotElements);
-                        auto pv_c0=c0[accum_slot*L0CSlotElements];
-                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(accum_slot);
-                        // NZ tiles in row-major tile order: first pass fills stripes
-                        // 0 and 2, second pass fills 1 and 3. No stripe is overwritten.
-                        PvFeatureStripe<true,true>(pipe,pslot,pv,dslot,
-                            pl,bl,a0,b0,pv_c0,2*Stripe);
-                        AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                        PvFeatureStripe<false,true>(pipe,pslot[PvRowTile*BN],pv,dslot[Stripe],
-                            pl,bl,a0,b0,pv_c0[Stripe],2*Stripe);
-                        StorePvRow32Batched(dslot,pv_c0,accum_slot);
-                        accum_slot^=1;
-                    } else {
-                        PvFeatureStripe<true>(pipe,pslot,pv,dslot,pl,bl,a0,b0,c0,L0CSlotElements);
-                        AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                        PvFeatureStripe<false>(pipe,pslot[PvRowTile*BN],pv,dslot[PvRowTile*D],
-                            pl,bl,a0,b0,c0,L0CSlotElements);
-                    }
-                } else {
-                    // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
-                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
-                        Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
-                            dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
-                            BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
-                            Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
-                    }
-                    accum_slot^=1;
-                }
+                accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
                 ++issued_pv;
-                if constexpr(PrioritizeP) {
-                    if(qk_key>=0) {
-                        EmitQkStack<BM,BN>(pipe,qgm[base+uint64_t(qs)*D],
-                            kgm[base+uint64_t(qk_key)*D],sgm[score_offset],
-                            ql,bl,a0,b0,c0,accum_slot,slot,false);
-                    }
-                }
             }
             const uint32_t first_pending=issued_pv>PvRelaySlots ? issued_pv-PvRelaySlots : 0;
             for(uint32_t tile=first_pending;tile<issued_pv;++tile)
@@ -425,7 +330,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareTile<R,BN,true,PvRow32>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
+            PrepareTile<R,BN,true>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
                 m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe);
             uint32_t prepared=1;
             for(uint32_t tile=0;tile<kv_tiles;++tile) {
@@ -450,7 +355,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                         next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
                     }
                     // The previous PV from this slot was consumed before reusing its P and alpha.
-                    PrepareTile<R,BN,false,PvRow32>(sgm[next_score_offset+score_row_offset],pgm,next_s,next_p,
+                    PrepareTile<R,BN,false>(sgm[next_score_offset+score_row_offset],pgm,next_s,next_p,
                         oh,partial0,partial1,m,l,alpha[next_slot*R],maxA,maxB,sumA,sumB,row_blocks,
                         masks,gm_slot,next_slot,sub,pipe);
                 }
@@ -474,13 +379,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false,bool PrioritizeP=false,bool DeferQkFixpipe=false>
+template<uint32_t BM,uint32_t BN>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PvRow32,BatchFix,PrioritizeP,DeferQkFixpipe>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA
