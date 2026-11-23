@@ -199,11 +199,12 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN>
+template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
+    static_assert(!PrefetchV || (BM==128 && BN==512));
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -226,13 +227,17 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         constexpr uint32_t MaxK=CubeKv>D?CubeKv:D, MaxN=MaxK;
         constexpr uint32_t L0CSlotElements=BM*MaxN;
         static_assert(2*L0CSlotElements*sizeof(float)<=128*1024);
-        AscendC::TBuf<AscendC::TPosition::A1> qB,pB,bB;
+        AscendC::TBuf<AscendC::TPosition::A1> qB,pB,bB,pvVB;
         AscendC::TBuf<AscendC::TPosition::A2> a0B;
         AscendC::TBuf<AscendC::TPosition::B2> b0B;
         AscendC::TBuf<AscendC::TPosition::CO1> c0B;
         pipe.InitBuffer(qB,BM*D*sizeof(half));
         pipe.InitBuffer(pB,BM*CubeKv*sizeof(half));
         pipe.InitBuffer(bB,CubeKv*D*sizeof(half));
+        if constexpr(PrefetchV) {
+            static_assert((BM*D+BM*CubeKv+CubeKv*D+BN*D)*sizeof(half)<=512*1024);
+            pipe.InitBuffer(pvVB,BN*D*sizeof(half));
+        }
         pipe.InitBuffer(a0B,BM*MaxK*sizeof(half));
         pipe.InitBuffer(b0B,CubeKv*D*sizeof(half));
         pipe.InitBuffer(c0B,2*L0CSlotElements*sizeof(float));
@@ -266,14 +271,21 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
                 const uint32_t pv_slot=issued_pv%PvRelaySlots;
+                auto pv_bl=bl;
+                if constexpr(PrefetchV) {
+                    pv_bl=pvVB.template Get<half>();
+                    PrefetchPvV<CubeKv,D,BN>(pipe,vgm[base+uint64_t(pv_key)*D],pv_bl);
+                }
                 if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
                 // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
                 for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                    auto pv_slice=pv_bl;
+                    if constexpr(PrefetchV) pv_slice=pv_bl[kv*D];
                     Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
-                        dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                        dgm[pv_slot*BM*D],pl,pv_slice,a0,b0,c0[accum_slot*L0CSlotElements],
                         BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
-                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
+                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN,!PrefetchV);
                 }
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
@@ -379,13 +391,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN>
+template<uint32_t BM,uint32_t BN,bool PrefetchV=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PrefetchV>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

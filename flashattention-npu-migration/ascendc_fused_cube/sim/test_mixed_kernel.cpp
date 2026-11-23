@@ -14,12 +14,12 @@ namespace {
 constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
-template<int Core, unsigned BM, unsigned BN>
+template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN>(q, k, v, out, relay, masks, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN, PrefetchV>(q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -44,7 +44,7 @@ uint64_t ExpectedIterations(uint32_t group, uint32_t groups, uint32_t heads, uin
     return count;
 }
 
-template<unsigned BM, unsigned BN>
+template<unsigned BM, unsigned BN, bool PrefetchV=false>
 void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
@@ -81,11 +81,20 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
     Require(aic.mmad_calls == 2 * iterations * (BN / G::CubeKv),
         "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
+    constexpr uint64_t v_elements=uint64_t(BN)*CubeFA::D;
+    Require(aic.prefetched_v_elements == (PrefetchV ? iterations*v_elements : 0) &&
+            aic.prefetched_v_elements == aic.prefetched_v_consumed,
+        "AIC must use the prefetched V once and avoid redundant GM loads");
+    Require(aic.prefetched_v_at_p_wait.size() == iterations, "unexpected P wait count");
+    for (size_t i=0;i<aic.prefetched_v_at_p_wait.size();++i) {
+        Require(aic.prefetched_v_at_p_wait[i] == (PrefetchV ? (i+1)*v_elements : 0),
+            "AIC must stage the entire current V stack before waiting for P");
+    }
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
         "AIC score/delta workspace write count is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A1)] ==
                 uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * G::CubeKv * 2 +
-                uint64_t(G::CubeKv) * CubeFA::D * 2,
+                uint64_t(G::CubeKv) * CubeFA::D * 2 + (PrefetchV ? v_elements * 2 : 0),
         "AIC A1 buffer sizes do not match the mixed schedule");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] == uint64_t(BM) * MaxK * 2,
         "AIC A2 buffer size is incorrect");
@@ -140,7 +149,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     }
 }
 
-template<unsigned BM, unsigned BN>
+template<unsigned BM, unsigned BN, bool PrefetchV=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -172,7 +181,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PrefetchV>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -182,7 +191,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PrefetchV>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -204,7 +213,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     uint64_t total_mmad_calls = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
-        CheckStats<BM, BN>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        CheckStats<BM, BN, PrefetchV>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
         total_iterations += iterations;
         total_mmad_calls += aic_stats[group].mmad_calls;
@@ -251,8 +260,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, seq, heads, groups, repeat, (unsigned long long)total_iterations,
+    std::printf("PASS BM=%u BN=%u PrefetchV=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PrefetchV, seq, heads, groups, repeat, (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
 
@@ -273,6 +282,12 @@ int main(int argc, char** argv) {
             std::puts("PASS mixed AIC/AIV CPU semantic smoke case");
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--prefetch-pv-v") {
+            Check<128, 512, true>(512, 2, 3, 0);
+            Check<128, 512, true>(1536, 1, 10, 0);
+            Check<128, 512, true>(2560, 1, 3, 0);
+            return 0;
+        }
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();
@@ -282,6 +297,9 @@ int main(int argc, char** argv) {
         Check<32, 64>(640, 1, 3, 0);
         Check<128, 512>(512, 2, 3, 0);
         Check<128, 512>(2560, 1, 3, 0);
+        Check<128, 512, true>(512, 2, 3, 0);
+        Check<128, 512, true>(1536, 1, 10, 0);
+        Check<128, 512, true>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

@@ -15,6 +15,24 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
     AscendC::SetFlag<E>(id); AscendC::WaitFlag<E>(id);
 }
 
+// Independent V staging: issue the same packed L1 copies as the PV loop
+// without waiting for P (or for MTE2 to finish). The PV GEMM's MTE2_MTE1
+// dependency covers the prefetched V as well as the subsequent P copy.
+template<uint32_t SliceKv,uint32_t HeadDim,uint32_t StackKv>
+__aicore__ inline void PrefetchPvV(AscendC::TPipe& pipe,AscendC::GlobalTensor<half> v,
+    AscendC::LocalTensor<half> staged)
+{
+    using B=Catlass::Gemm::GemmType<half,Catlass::layout::RowMajor>;
+    using Copy=Catlass::Gemm::Tile::CopyGmToL1<Catlass::Arch::AtlasA2,B>;
+    using Layout=typename Copy::LayoutDst;
+    auto layout=Layout::template MakeLayout<half>(SliceKv,HeadDim);
+    // Prior PV may still be reading this staging area on MTE1.
+    Sync<AscendC::HardEvent::MTE1_MTE2>(pipe);
+    for(uint32_t kv=0;kv<StackKv;kv+=SliceKv)
+        Copy{}(staged[kv*HeadDim],v[kv*HeadDim],layout,
+            Catlass::layout::RowMajor(SliceKv,HeadDim));
+}
+
 template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     AscendC::GlobalTensor<half> a, AscendC::GlobalTensor<half> b,
@@ -22,7 +40,7 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     AscendC::LocalTensor<half> lb, AscendC::LocalTensor<half> l0a,
     AscendC::LocalTensor<half> l0b, AscendC::LocalTensor<float> l0c,
     uint32_t m,uint32_t n,uint32_t k,ALayout a_layout,BLayout b_layout,bool load_a=true,
-    int32_t l0c_slot=0,uint32_t c_stride=0,bool init_c=true,bool store_c=true)
+    int32_t l0c_slot=0,uint32_t c_stride=0,bool init_c=true,bool store_c=true,bool load_b=true)
 {
     using Arch=Catlass::Arch::AtlasA2;
     using AT=Catlass::Gemm::GemmType<half,ALayout>;
@@ -40,7 +58,7 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     auto cl0=Catlass::layout::zN::MakeLayoutInL0C(Catlass::MakeCoord(m,n));
     Sync<AscendC::HardEvent::MTE1_MTE2>(pipe);
     if(load_a) typename Copies::CopyGmToL1A{}(la,a,al1,a_layout);
-    typename Copies::CopyGmToL1B{}(lb,b,bl1,b_layout);
+    if(load_b) typename Copies::CopyGmToL1B{}(lb,b,bl1,b_layout);
     Sync<AscendC::HardEvent::MTE2_MTE1>(pipe);
     Sync<AscendC::HardEvent::M_MTE1>(pipe);
     typename Copies::CopyL1ToL0A{}(l0a,la,al0,al1);

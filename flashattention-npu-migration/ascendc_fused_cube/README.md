@@ -205,3 +205,18 @@ python -u run.py --seq 16384 --heads 2 --block-m 128 --block-n 512 \
   --seeds 1234 4321 --rows 64 --warmup 3 --repeat 5 \
   --output generated_16k_bm128_bn512.json
 ```
+
+### PV V prefetch before P_READY
+
+For BM128/BN512, `--prefetch-pv-v` submits the four 128×128 FP16 V
+loads to a separate 128 KiB L1 buffer before waiting for P_READY.
+The subsequent PV GEMMs consume those staged slices instead of loading
+V again. The P loads, L0A/L0B reuse, QK order and FP32 PV accumulation
+remain the same. There are four PV MMADs and one PV Fixpipe per stack.
+The GM relay and V transfer volume are unchanged; the extra L1 staging
+brings the explicit Cube L1 buffers to 224 KiB.
+
+Run the same BM128/BN512 benchmark with and without `--prefetch-pv-v`.
+A 1536 / core9 simulator comparison can show the V loads on MTE2 before
+P_READY and how much of their time overlaps the wait. Only the 16K board
+timings can determine whether the new reads help the full kernel.

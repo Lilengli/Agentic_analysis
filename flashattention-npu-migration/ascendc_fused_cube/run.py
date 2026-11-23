@@ -22,6 +22,8 @@ def main():
     p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
     p.add_argument('--block-n', type=int, choices=(64, 128, 512), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
+    p.add_argument('--prefetch-pv-v', action='store_true',
+                   help='prefetch the BN512 V stack to L1 before P_READY')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
     p.add_argument('--warmup', type=int, default=1)
@@ -38,6 +40,8 @@ def main():
             and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
                 'or experimental BM128/BN512; S must be divisible by BN, groups 1..24, counts positive')
+    if a.prefetch_pv_v and (a.block_m, a.block_n) != (128, 512):
+        p.error('--prefetch-pv-v requires --block-m 128 --block-n 512')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
@@ -51,6 +55,7 @@ def main():
     if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
         raise RuntimeError('loaded extension does not match build manifest')
     implementation = dict(fused_cube_ext.metadata())
+    implementation['pv_v_load_order'] = 'before P_READY' if a.prefetch_pv_v else 'after P_READY'
     print('implementation:', implementation, flush=True)
     from verify_products import run_checks
     run_checks()
@@ -59,7 +64,7 @@ def main():
     checks = []
 
     def call():
-        return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks)
+        return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks, a.prefetch_pv_v)
 
     def verify(out, label):
         # Copy only sampled outputs for CPU FP32 comparison. All values in all
@@ -154,6 +159,7 @@ def main():
     result = {'shape': shape, 'dtype': 'float16', 'causal': True, 'device': torch.npu.get_device_name(0),
               'torch_version': torch.__version__, 'torch_npu_version': getattr(torch_npu,'__version__','unknown'), 'correct': True, 'checks': checks, 'query_rows_checked': indices.tolist(),
               'block_m': a.block_m, 'block_n': a.block_n, 'blocks': a.blocks,
+              'prefetch_pv_v': a.prefetch_pv_v,
               'gm_relay_bytes': a.blocks * implementation[f'gm_relay_bytes_per_group_bm{a.block_m}_bn{a.block_n}'],
               'implementation': implementation, 'wall_ms': wall_ms, 'event_us': event_us,
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,

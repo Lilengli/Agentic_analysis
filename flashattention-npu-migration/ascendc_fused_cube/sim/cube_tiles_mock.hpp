@@ -100,6 +100,9 @@ struct Stats {
     };
 
     uint64_t gm_read_elements = 0;
+    uint64_t prefetched_v_elements = 0;
+    uint64_t prefetched_v_consumed = 0;
+    std::vector<uint64_t> prefetched_v_at_p_wait;
     uint64_t reads_before_first_qk = 0;
     uint64_t gm_write_elements = 0;
     uint64_t mmad_calls = 0;
@@ -233,6 +236,8 @@ inline void WaitFlag(uint32_t flag) {
             auto& counts = p_ready ? context.stats->pending_qk_at_p_waits
                                    : context.stats->pending_qk_at_done_waits;
             ++counts[pending];
+            if (p_ready)
+                context.stats->prefetched_v_at_p_wait.push_back(context.stats->prefetched_v_elements);
         }
         const uint64_t target = (context.waited_arrivals[flag] + 1) * kAivCount;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
@@ -533,14 +538,27 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
     AscendC::WaitFlag<E>(id);
 }
 
+template<uint32_t SliceKv,uint32_t HeadDim,uint32_t StackKv>
+inline void PrefetchPvV(AscendC::TPipe&,AscendC::GlobalTensor<half> v,
+    AscendC::LocalTensor<half> staged)
+{
+    static_assert(StackKv%SliceKv==0);
+    constexpr size_t elements=StackKv*HeadDim;
+    if(v.length<elements || staged.length<elements)
+        throw std::runtime_error("mixed simulator: V prefetch is out of bounds");
+    CubeFASim::CountRead(elements);
+    if(auto* stats=CubeFASim::context.stats) stats->prefetched_v_elements+=elements;
+    for(size_t i=0;i<elements;++i) staged.SetValue(i,v.data[i]);
+}
+
 template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::GlobalTensor<half> b, AscendC::GlobalTensor<float> c,
-        AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
+        AscendC::LocalTensor<half>, AscendC::LocalTensor<half> lb,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
         ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0,
-        uint32_t c_stride = 0, bool init_c = true, bool store_c = true) {
+        uint32_t c_stride = 0, bool init_c = true, bool store_c = true, bool load_b = true) {
     if constexpr (DoubleBufferedL0C) {
         const size_t slot_bytes = l0c.owner->size() / 2;
         if (l0c.offset != size_t(l0c_slot) * slot_bytes || size_t(m) * n * sizeof(float) > slot_bytes)
@@ -558,15 +576,19 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
     const size_t last_a = a_layout.Offset(m - 1, k - 1) + 1;
     const size_t last_b = b_layout.Offset(k - 1, n - 1) + 1;
     const size_t output_extent = size_t(m - 1) * stride + n;
-    if (a.length < last_a || b.length < last_b || c.length < output_extent ||
-        l0c.length < size_t(m) * n)
+    if (a.length < last_a || (load_b ? b.length : lb.length) < last_b ||
+        c.length < output_extent || l0c.length < size_t(m) * n)
         throw std::runtime_error("mixed simulator: GEMM operand or output out of bounds");
-    CubeFASim::CountRead(size_t(m) * k + size_t(k) * n);
+    CubeFASim::CountRead(size_t(m)*k+(load_b ? size_t(k)*n : 0));
+    if (auto* stats=CubeFASim::context.stats; stats && !load_b)
+        stats->prefetched_v_consumed+=size_t(k)*n;
     for (uint32_t i = 0; i < m; ++i) {
         for (uint32_t j = 0; j < n; ++j) {
             float sum = 0.0f;
-            for (uint32_t x = 0; x < k; ++x)
-                sum += float(a.data[a_layout.Offset(i, x)]) * float(b.data[b_layout.Offset(x, j)]);
+            for (uint32_t x = 0; x < k; ++x) {
+                const size_t bi=b_layout.Offset(x,j);
+                sum+=float(a.data[a_layout.Offset(i,x)])*float(load_b ? b.data[bi] : lb.GetValue(bi));
+            }
             const size_t local_index = size_t(i) * n + j;
             if (!init_c) sum += l0c.GetValue(local_index);
             l0c.SetValue(local_index, sum);
