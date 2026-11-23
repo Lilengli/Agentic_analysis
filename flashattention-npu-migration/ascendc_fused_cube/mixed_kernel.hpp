@@ -70,10 +70,9 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
     }
     // The preceding barrier has released the row-block scratch used by output rescale.
     ReduceRowMax64<Rows,BN>(maxA,s,row_blocks);
-    constexpr uint32_t Fp32Repeat=256/sizeof(float);
-    for(uint32_t col=Fp32Repeat;col<BN;col+=Fp32Repeat) {
+    if constexpr(BN==128) {
         AscendC::PipeBarrier<PIPE_V>();
-        ReduceRowMax64<Rows,BN>(maxB,s[col],row_blocks);
+        ReduceRowMax64<Rows,BN>(maxB,s[64],row_blocks);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Max(maxA,maxA,maxB,Rows);
     }
@@ -107,9 +106,9 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>();
     // The preceding barrier releases the scratch used to broadcast row maxima.
     ReduceRowSum64<R,BN>(sumA,s,row_blocks);
-    for(uint32_t col=Fp32Repeat;col<BN;col+=Fp32Repeat) {
+    if constexpr(BN==128) {
         AscendC::PipeBarrier<PIPE_V>();
-        ReduceRowSum64<R,BN>(sumB,s[col],row_blocks);
+        ReduceRowSum64<R,BN>(sumB,s[64],row_blocks);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(sumA,sumA,sumB,R);
     }
@@ -143,7 +142,6 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     if constexpr(Core==AscendC::AIC) {
         constexpr uint32_t MaxK=BN>D?BN:D, MaxN=MaxK;
         constexpr uint32_t L0CSlotElements=BM*MaxN;
-        static_assert(BM*MaxK*sizeof(half)<=64*1024 && BN*D*sizeof(half)<=64*1024);
         static_assert(2*L0CSlotElements*sizeof(float)<=128*1024);
         AscendC::TBuf<AscendC::TPosition::A1> qB,pB,bB;
         AscendC::TBuf<AscendC::TPosition::A2> a0B;
@@ -202,14 +200,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         constexpr uint32_t ScoreElements=R*BN;
         constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
         static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0 && D%Fp32Repeat==0);
+        static_assert(BN<=D);  // The final-output staging buffer also holds a P tile.
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
         pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float));
         pipe.InitBuffer(pB,(PvRelaySlots-1)*ScoreElements*sizeof(half));
-        pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4);
-        // Final output staging also holds one P tile.
-        pipe.InitBuffer(ohB,G::OutputStagingElements*sizeof(half));
+        pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,PvRelaySlots*R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);

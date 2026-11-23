@@ -72,15 +72,8 @@ P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
 steady interval between PV_READY events and the whole call time.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
-S divisible by BN and up to 16384; BM32/64/128 with BM<=BN for BN64/128,
-plus BM64/BN256; 1..24 AIC groups. No GQA, dropout, variable-length tails or backward.
-
-The BM64/BN256 experiment processes twice as many KV tokens per PV handoff
-as BM64/BN128. Two 64 KiB L0C slots still fit, and L0B uses 64 KiB. Each AIV
-uses 153,728 bytes of explicit UB plus the 8 KiB Select workspace. The GM
-relay uses 448 KiB per group, or 10.5 MiB with 24 groups. On the same build,
-compare BM64/BN128 with BM64/BN256 to isolate KV width, and BM128/BN128 as the
-existing performance baseline.
+S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
+dropout, variable-length tails or backward.
 
 ## Build and run on the target
 
@@ -133,10 +126,9 @@ semantic mock. Its abstract GEMM does not simulate physical fractal conversion,
 and software flags do not validate hardware event ordering. Actual CANN/NPU
 compilation, products, repeated mixed runs and MAC counters remain necessary.
 
-The semantic suite covers the five original tile configurations,
+The semantic suite covers all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. It also checks S512 with
 BM128/BN128 and S640 with BM32/BN64, including a full score ring and wraparound.
-BM64/BN256 runs at S256 and S2560 to cover all four causal alignments and repeated ring wraparound.
 It checks the score ring depth, PV relay reuse waits, and compares results
 against an independent FP64 causal reference with atol=.002 and rtol=.01.
 Other checks cover two matrix products per KV iteration,

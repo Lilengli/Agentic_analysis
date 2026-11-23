@@ -80,8 +80,8 @@ __global__ __cube__ void cube_product_probe(GM_ADDR a,GM_ADDR b,GM_ADDR c,
     AscendC::TBuf<AscendC::TPosition::A2> a0B;
     AscendC::TBuf<AscendC::TPosition::B2> b0B;
     AscendC::TBuf<AscendC::TPosition::CO1> c0B;
-    pipe.InitBuffer(laB,128*128*2); pipe.InitBuffer(lbB,256*128*2);
-    pipe.InitBuffer(a0B,128*128*2); pipe.InitBuffer(b0B,256*128*2);
+    pipe.InitBuffer(laB,128*128*2); pipe.InitBuffer(lbB,128*128*2);
+    pipe.InitBuffer(a0B,128*128*2); pipe.InitBuffer(b0B,128*128*2);
     pipe.InitBuffer(c0B,128*128*4);
     auto la=laB.Get<half>(); auto lb=lbB.Get<half>();
     auto a0=a0B.Get<half>(); auto b0=b0B.Get<half>(); auto c0=c0B.Get<float>();
