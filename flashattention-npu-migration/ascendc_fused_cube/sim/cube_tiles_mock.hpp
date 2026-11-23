@@ -105,6 +105,7 @@ struct Stats {
     std::vector<uint64_t> prefetched_v_at_p_wait;
     uint64_t reads_before_first_qk = 0;
     uint64_t gm_write_elements = 0;
+    uint64_t l0a_loads = 0;
     uint64_t mmad_calls = 0;
     uint64_t block_reduce_max_calls = 0;
     uint64_t block_reduce_sum_calls = 0;
@@ -598,13 +599,13 @@ inline void PrefetchPvV(AscendC::TPipe&,AscendC::GlobalTensor<half> v,
     for(size_t i=0;i<elements;++i) staged.SetValue(i,v.data[i]);
 }
 
-template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
+template<bool DoubleBufferedL0C=false, bool ReuseL0A=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::GlobalTensor<half> b, AscendC::GlobalTensor<float> c,
-        AscendC::LocalTensor<half>, AscendC::LocalTensor<half> lb,
-        AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
+        AscendC::LocalTensor<half> la, AscendC::LocalTensor<half> lb,
+        AscendC::LocalTensor<half> l0a, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
-        ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0,
+        ALayout a_layout, BLayout b_layout, bool load_a = true, int32_t l0c_slot = 0,
         uint32_t c_stride = 0, bool init_c = true, bool store_c = true, bool load_b = true) {
     if constexpr (DoubleBufferedL0C) {
         const size_t slot_bytes = l0c.owner->size() / 2;
@@ -622,19 +623,35 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         throw std::runtime_error("mixed simulator: GEMM operand/output alignment is invalid");
     const size_t last_a = a_layout.Offset(m - 1, k - 1) + 1;
     const size_t last_b = b_layout.Offset(k - 1, n - 1) + 1;
+    const size_t a_elements = size_t(m) * k;
     const size_t output_extent = size_t(m - 1) * stride + n;
-    if (a.length < last_a || (load_b ? b.length : lb.length) < last_b ||
+    if ((load_a && a.length < last_a) || (load_b ? b.length : lb.length) < last_b ||
+        la.length < a_elements || l0a.length < a_elements ||
         c.length < output_extent || l0c.length < size_t(m) * n)
         throw std::runtime_error("mixed simulator: GEMM operand or output out of bounds");
-    CubeFASim::CountRead(size_t(m)*k+(load_b ? size_t(k)*n : 0));
-    if (auto* stats=CubeFASim::context.stats; stats && !load_b)
-        stats->prefetched_v_consumed+=size_t(k)*n;
+    if (load_a) {
+        for (uint32_t i = 0; i < m; ++i)
+            for (uint32_t x = 0; x < k; ++x)
+                la.SetValue(size_t(i) * k + x, a.data[a_layout.Offset(i,x)]);
+    }
+    const size_t a_bytes = a_elements * sizeof(half);
+    auto* l0a_data = l0a.owner->data() + l0a.offset;
+    auto* stats = CubeFASim::context.stats;
+    if (!ReuseL0A || load_a) {
+        std::memcpy(l0a_data, la.owner->data() + la.offset, a_bytes);
+        if (stats) ++stats->l0a_loads;
+    }
+    // Read the actual slot contents so reuse checks catch overwrites and stale Q.
+    std::vector<half> a_tile(a_elements);
+    std::memcpy(a_tile.data(), l0a_data, a_bytes);
+    CubeFASim::CountRead((load_a ? a_elements : 0) + (load_b ? size_t(k) * n : 0));
+    if (stats && !load_b) stats->prefetched_v_consumed += size_t(k) * n;
     for (uint32_t i = 0; i < m; ++i) {
         for (uint32_t j = 0; j < n; ++j) {
             float sum = 0.0f;
             for (uint32_t x = 0; x < k; ++x) {
                 const size_t bi=b_layout.Offset(x,j);
-                sum+=float(a.data[a_layout.Offset(i,x)])*float(load_b ? b.data[bi] : lb.GetValue(bi));
+                sum+=float(a_tile[size_t(i)*k+x])*float(load_b ? b.data[bi] : lb.GetValue(bi));
             }
             const size_t local_index = size_t(i) * n + j;
             if (!init_c) sum += l0c.GetValue(local_index);

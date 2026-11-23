@@ -33,7 +33,7 @@ __aicore__ inline void PrefetchPvV(AscendC::TPipe& pipe,AscendC::GlobalTensor<ha
             Catlass::layout::RowMajor(SliceKv,HeadDim));
 }
 
-template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
+template<bool DoubleBufferedL0C=false, bool ReuseL0A=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     AscendC::GlobalTensor<half> a, AscendC::GlobalTensor<half> b,
     AscendC::GlobalTensor<float> c, AscendC::LocalTensor<half> la,
@@ -61,7 +61,8 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     if(load_b) typename Copies::CopyGmToL1B{}(lb,b,bl1,b_layout);
     Sync<AscendC::HardEvent::MTE2_MTE1>(pipe);
     Sync<AscendC::HardEvent::M_MTE1>(pipe);
-    typename Copies::CopyL1ToL0A{}(l0a,la,al0,al1);
+    // In the resident Q path the first GM load also establishes the L0A copy.
+    if (!ReuseL0A || load_a) typename Copies::CopyL1ToL0A{}(l0a,la,al0,al1);
     typename Copies::CopyL1ToL0B{}(l0b,lb,bl0,bl1);
     Sync<AscendC::HardEvent::MTE1_M>(pipe);
     if (init_c) {

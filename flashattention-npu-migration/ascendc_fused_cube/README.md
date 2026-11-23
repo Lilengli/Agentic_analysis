@@ -277,3 +277,15 @@ own GM relay slots and writes each query to its original output rows.
 For S=16384, two heads and 24 groups, the predicted physical KV slice
 counts go from 610–768 per group to 678–693. Compare with the flag off
 using the same tile, diagonal trimming and normalization settings.
+
+### Keep the query tile in L0A (BM128/BN512)
+
+Add `--keep-q-l0a` to `--cross-query --trim-diagonal`. The first QK
+slice of each query loads its 128-by-128 FP16 Q tile into a dedicated
+32 KiB L0A slot. All subsequent QK slices of that query read the same
+slot. PV loads P into the other 32 KiB slot. Each AIC uses 64 KiB of
+L0A in this mode.
+
+With S=16384 and two heads, Q loads from L1 to L0A drop from 16,512 to
+256, a reduction of 508 MiB of logical on-chip transfers. Compare
+with the flag off using the same query assignment and normalization.
