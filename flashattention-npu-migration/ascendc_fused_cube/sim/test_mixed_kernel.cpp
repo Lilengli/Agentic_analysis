@@ -15,12 +15,12 @@ constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
 template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
-    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false, bool KeepQInL0A=false>
+    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries, KeepQInL0A>(
+    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
         q, k, v, out, relay, masks, heads, seq, groups);
 }
 
@@ -55,7 +55,7 @@ std::vector<uint64_t> ExpectedKvPrefix(const std::vector<uint32_t>& query_tasks,
 }
 
 template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
-    bool TrimDiagonal=false, bool VectorNormalize=false, bool KeepQInL0A=false>
+    bool TrimDiagonal=false, bool VectorNormalize=false>
 void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32_t seq,
         const std::vector<uint64_t>& kv_prefix,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
@@ -105,11 +105,8 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
-    const uint64_t slices = kv_total / G::CubeKv;
-    Require(aic.mmad_calls == 2 * slices,
+    Require(aic.mmad_calls == 2 * (kv_total / G::CubeKv),
         "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
-    Require(aic.l0a_loads == slices + (KeepQInL0A ? tasks : slices),
-        "AIC did not load Q and P into L0A at the expected frequency");
     constexpr uint64_t v_elements=uint64_t(BN)*CubeFA::D;
     Require(aic.prefetched_v_elements == (PrefetchV ? kv_total*CubeFA::D : 0) &&
             aic.prefetched_v_elements == aic.prefetched_v_consumed,
@@ -125,8 +122,7 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
                 uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * G::CubeKv * 2 +
                 uint64_t(G::CubeKv) * CubeFA::D * 2 + (PrefetchV ? v_elements * 2 : 0),
         "AIC A1 buffer sizes do not match the mixed schedule");
-    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] ==
-                (KeepQInL0A ? 2 : 1) * uint64_t(BM) * MaxK * sizeof(half),
+    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] == uint64_t(BM) * MaxK * 2,
         "AIC A2 buffer size is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::B2)] ==
                 uint64_t(G::CubeKv) * CubeFA::D * 2,
@@ -183,7 +179,7 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
 }
 
 template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
-    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false, bool KeepQInL0A=false>
+    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -215,8 +211,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries,
-                    KeepQInL0A>(
+                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
                     group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
@@ -227,8 +222,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries,
-                        KeepQInL0A>(
+                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
                         group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
@@ -257,7 +251,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         const auto query_tasks = ExpectedQueryTasks(group, groups, heads * (seq / BM), BalanceQueries);
         const auto kv_prefix = ExpectedKvPrefix<BM, BN, TrimDiagonal>(query_tasks, seq);
-        CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, KeepQInL0A>(
+        CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(
             group, query_tasks, seq, kv_prefix, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         total_iterations += kv_prefix.size() - 1;
         const uint64_t kv_total=kv_prefix.back();
@@ -306,8 +300,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d VectorNormalize=%d BalanceQueries=%d KeepQInL0A=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries, KeepQInL0A, seq, heads, groups, repeat,
+    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d VectorNormalize=%d BalanceQueries=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries, seq, heads, groups, repeat,
         (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
@@ -358,13 +352,6 @@ void CheckBalancedQueries() {
     Check<128, 512, true, true, true, false, true>(1536, 1, 10, 0);
     Check<128, 512, true, true, true, true, true>(1024, 2, 3, 0);
 }
-
-void CheckResidentQ() {
-    Check<128, 512, true, true, true, false, false, true>(512, 2, 3, 0);
-    Check<128, 512, true, true, true, true, false, true>(512, 1, 2, 0);
-    Check<128, 512, true, true, true, false, true, true>(2560, 1, 3, 0);
-    Check<128, 512, true, true, true, true, true, true>(1024, 2, 3, 0);
-}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -402,11 +389,6 @@ int main(int argc, char** argv) {
             CheckBalancedQueries();
             return 0;
         }
-        if (argc == 2 && std::string(argv[1]) == "--keep-q-l0a") {
-            CheckResidentQ();
-            return 0;
-        }
-        CheckResidentQ();
         CheckBalancedQueries();
         CheckShape<32, 64>();
         CheckShape<32, 128>();

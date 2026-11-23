@@ -32,8 +32,7 @@ at::Tensor GetCausalMask(c10::Device device,int64_t bm,int64_t bn)
 
 at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     int64_t bm=64,int64_t bn=128,int64_t groups=24,std::optional<bool> prefetch_pv_v=std::nullopt,
-    bool cross_query=false,bool trim_diagonal=false,bool vector_normalize=false,bool balance_queries=false,
-    bool keep_q_l0a=false)
+    bool cross_query=false,bool trim_diagonal=false,bool vector_normalize=false,bool balance_queries=false)
 {
     TORCH_CHECK(q.device().type()==c10::DeviceType::PrivateUse1 && q.device()==k.device() && q.device()==v.device(),"same NPU required");
     TORCH_CHECK(q.dim()==4 && q.sizes()==k.sizes() && q.sizes()==v.sizes(),"matching BNSD tensors required");
@@ -50,7 +49,6 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(!trim_diagonal || cross_query,"trim_diagonal requires cross_query");
     TORCH_CHECK(!vector_normalize || trim_diagonal,"vector_normalize requires trim_diagonal");
     TORCH_CHECK(!balance_queries || trim_diagonal,"balance_queries requires trim_diagonal");
-    TORCH_CHECK(!keep_q_l0a || trim_diagonal,"keep_q_l0a requires trim_diagonal");
     TORCH_CHECK(groups>0 && groups<=24,"groups must be 1..24");
     const int64_t heads=q.size(0)*q.size(1);
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
@@ -75,14 +73,6 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==128 && bn==128) CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(keep_q_l0a && balance_queries && vector_normalize)
-        CubeFA::fused_cube_attention<128,512,true,true,true,true,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(keep_q_l0a && balance_queries)
-        CubeFA::fused_cube_attention<128,512,true,true,true,false,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(keep_q_l0a && vector_normalize)
-        CubeFA::fused_cube_attention<128,512,true,true,true,true,false,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(keep_q_l0a)
-        CubeFA::fused_cube_attention<128,512,true,true,true,false,false,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(balance_queries && vector_normalize)
         CubeFA::fused_cube_attention<128,512,true,true,true,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(balance_queries)
@@ -119,7 +109,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         pybind11::arg("block_m")=64,pybind11::arg("block_n")=128,pybind11::arg("blocks")=24,
         pybind11::arg("prefetch_pv_v")=pybind11::none(),pybind11::arg("cross_query")=false,
         pybind11::arg("trim_diagonal")=false,pybind11::arg("vector_normalize")=false,
-        pybind11::arg("balance_queries")=false,pybind11::arg("keep_q_l0a")=false);
+        pybind11::arg("balance_queries")=false);
     m.def("metadata",[](){
         pybind11::dict d;
         d["engine"]="AIC Cube + two AIV per group; QK and PV use Mmad";
