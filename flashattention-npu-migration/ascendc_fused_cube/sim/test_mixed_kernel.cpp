@@ -14,12 +14,12 @@ namespace {
 constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
-template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false>
+template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery>(q, k, v, out, relay, masks, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -44,7 +44,23 @@ uint64_t ExpectedIterations(uint32_t group, uint32_t groups, uint32_t heads, uin
     return count;
 }
 
-template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false>
+template<unsigned BM, unsigned BN, bool TrimDiagonal>
+std::vector<uint64_t> ExpectedKvPrefix(uint32_t group, uint32_t groups,
+        uint32_t heads, uint32_t seq)
+{
+    const uint32_t tiles=seq/BM;
+    std::vector<uint64_t> prefix{0};
+    for(uint64_t task=group;task<uint64_t(heads)*tiles;task+=groups) {
+        const uint32_t qs=uint32_t(task%tiles)*BM;
+        for(uint32_t tile=0;tile<=qs/BN;++tile) {
+            const uint32_t width=TrimDiagonal && tile==0 ? qs%BN+BM : BN;
+            prefix.push_back(prefix.back()+width);
+        }
+    }
+    return prefix;
+}
+
+template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
 void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
@@ -60,10 +76,14 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending_before_done{};
     std::vector<uint64_t> expected_prepared_at_pv_wait;
     const uint32_t query_tiles = seq / BM;
-    uint64_t prepared = 0;
+    uint64_t prepared = 0, trimmed_tasks=0;
+    const auto kv_prefix=ExpectedKvPrefix<BM, BN, TrimDiagonal>(group,groups,heads,seq);
+    const uint64_t kv_total=kv_prefix.back();
     std::array<bool, CubeFA::PvRelaySlots> pending_pv{};
     for (uint64_t task = group; task < uint64_t(heads) * query_tiles; task += groups) {
-        const uint32_t kv_tiles = uint32_t(task % query_tiles) * BM / BN + 1;
+        const uint32_t qs=uint32_t(task%query_tiles)*BM;
+        const uint32_t kv_tiles=qs/BN+1;
+        if constexpr(TrimDiagonal) trimmed_tasks+=qs%BN+BM<BN;
         for (uint32_t remaining = kv_tiles; remaining > 0; --remaining) {
             ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
         }
@@ -90,18 +110,18 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
-    Require(aic.mmad_calls == 2 * iterations * (BN / G::CubeKv),
+    Require(aic.mmad_calls == 2 * (kv_total / G::CubeKv),
         "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
     constexpr uint64_t v_elements=uint64_t(BN)*CubeFA::D;
-    Require(aic.prefetched_v_elements == (PrefetchV ? iterations*v_elements : 0) &&
+    Require(aic.prefetched_v_elements == (PrefetchV ? kv_total*CubeFA::D : 0) &&
             aic.prefetched_v_elements == aic.prefetched_v_consumed,
         "AIC must use the prefetched V once and avoid redundant GM loads");
     Require(aic.prefetched_v_at_p_wait.size() == iterations, "unexpected P wait count");
     for (size_t i=0;i<aic.prefetched_v_at_p_wait.size();++i) {
-        Require(aic.prefetched_v_at_p_wait[i] == (PrefetchV ? (i+1)*v_elements : 0),
+        Require(aic.prefetched_v_at_p_wait[i] == (PrefetchV ? kv_prefix[i+1]*CubeFA::D : 0),
             "AIC must stage the entire current V stack before waiting for P");
     }
-    Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
+    Require(aic.gm_write_elements == uint64_t(BM)*(kv_total+iterations*CubeFA::D),
         "AIC score/delta workspace write count is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A1)] ==
                 uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * G::CubeKv * 2 +
@@ -129,7 +149,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             const auto& snapshot = av->pv_waits[i];
             Require(snapshot.p_ready_calls == scores_prepared,
                 "AIV must publish its full probability lookahead before waiting for the current PV");
-            Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
+            Require(snapshot.gm_read_elements == mask_reads + (kv_prefix[scores_prepared] + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * reductions_per_tile,
                 "AIV did not reduce the next score before waiting for PV");
@@ -139,9 +159,9 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             Require(snapshot.mul_calls == batches * scores_prepared + (i + 1) * (CubeFA::D / 64),
                 "AIV must rescale the denominator and output before waiting for PV");
         }
-        Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
+        Require(av->gm_read_elements == mask_reads + R*(kv_total+iterations*CubeFA::D),
             "AIV mask/score/delta GM read count is incorrect");
-        Require(av->gm_write_elements == iterations * uint64_t(R) * BN + tasks * uint64_t(R) * CubeFA::D,
+        Require(av->gm_write_elements == R*(kv_total+tasks*CubeFA::D),
             "AIV probability/output GM write count is incorrect");
         const uint64_t reduce_calls = iterations * reductions_per_tile;
         Require(av->block_reduce_max_calls == reduce_calls && av->block_reduce_sum_calls == reduce_calls,
@@ -155,12 +175,12 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV online-softmax vector operation counts are incorrect");
         Require(av->cast_calls == batches * iterations + tasks,
             "AIV probability or output conversion count is incorrect");
-        Require(av->duplicate_calls == 3 * tasks && av->select_calls == batches * tasks,
+        Require(av->duplicate_calls == 3 * tasks + trimmed_tasks && av->select_calls == batches * tasks,
             "AIV must initialize online state and select the packed mask per diagonal batch");
     }
 }
 
-template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false>
+template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -192,7 +212,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -202,7 +222,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -225,16 +245,19 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
 
     uint64_t total_iterations = 0;
     uint64_t total_mmad_calls = 0;
+    uint64_t total_kv = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
-        CheckStats<BM, BN, PrefetchV, CrossQuery>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
         total_iterations += iterations;
+        const uint64_t kv_total=ExpectedKvPrefix<BM, BN, TrimDiagonal>(group,groups,heads,seq).back();
+        total_kv+=kv_total;
         total_mmad_calls += aic_stats[group].mmad_calls;
-        total_output_writes += aiv0_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
-        total_output_writes += aiv1_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
+        total_output_writes += aiv0_stats[group].gm_write_elements - kv_total * (BM / 2);
+        total_output_writes += aiv1_stats[group].gm_write_elements - kv_total * (BM / 2);
     }
-    Require(total_mmad_calls == 2 * total_iterations * (BN / G::CubeKv),
+    Require(total_mmad_calls == 2 * (total_kv / G::CubeKv),
         "total AIC Mmad count does not match the QK and PV slices");
     Require(total_output_writes == elements, "output work partition left rows unwritten or wrote rows more than once");
 
@@ -274,8 +297,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, PrefetchV, CrossQuery, seq, heads, groups, repeat, (unsigned long long)total_iterations,
+    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, seq, heads, groups, repeat, (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
 
@@ -308,6 +331,12 @@ int main(int argc, char** argv) {
             Check<128, 512, true, true>(2560, 1, 3, 0);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--trim-diagonal") {
+            Check<128, 512, true, true, true>(512, 2, 3, 0);
+            Check<128, 512, true, true, true>(1536, 1, 10, 0);
+            Check<128, 512, true, true, true>(2560, 1, 3, 0);
+            return 0;
+        }
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();
@@ -323,6 +352,9 @@ int main(int argc, char** argv) {
         Check<128, 512, true, true>(1536, 1, 10, 0);
         Check<128, 512, true, true>(2048, 2, 9, 0);
         Check<128, 512, true, true>(2560, 1, 3, 0);
+        Check<128, 512, true, true, true>(512, 2, 3, 0);
+        Check<128, 512, true, true, true>(1536, 1, 10, 0);
+        Check<128, 512, true, true, true>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

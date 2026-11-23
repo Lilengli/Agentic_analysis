@@ -398,6 +398,25 @@ template <class T> void DataCopy(GlobalTensor<T> destination, LocalTensor<T> sou
     for (size_t i = 0; i < n; ++i) destination.data[i] = source.GetValue(i);
 }
 
+struct DataCopyParams {
+    uint16_t blockCount,blockLen,srcStride,dstStride;
+    DataCopyParams(uint16_t count,uint16_t len,uint16_t src,uint16_t dst)
+        :blockCount(count),blockLen(len),srcStride(src),dstStride(dst) {}
+};
+template<class T,class Dst,class Src>
+void CopyBlocks(Dst dst,Src src,const DataCopyParams& p) {
+    constexpr size_t block=32/sizeof(T);
+    for(size_t i=0;i<p.blockCount;++i)
+        DataCopy(dst[i*(p.blockLen+p.dstStride)*block],
+            src[i*(p.blockLen+p.srcStride)*block],p.blockLen*block);
+}
+template<class T> void DataCopy(LocalTensor<T> dst,GlobalTensor<T> src,const DataCopyParams& p) {
+    CopyBlocks<T>(dst,src,p);
+}
+template<class T> void DataCopy(GlobalTensor<T> dst,LocalTensor<T> src,const DataCopyParams& p) {
+    CopyBlocks<T>(dst,src,p);
+}
+
 template <class A, class B> void Cast(LocalTensor<A> destination, LocalTensor<B> source, RoundMode, size_t n) {
     if (n > destination.length || n > source.length) throw std::runtime_error("mixed simulator: Cast out of bounds");
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, static_cast<A>(source.GetValue(i)));
@@ -560,10 +579,12 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
 
 template<uint32_t SliceKv,uint32_t HeadDim,uint32_t StackKv>
 inline void PrefetchPvV(AscendC::TPipe&,AscendC::GlobalTensor<half> v,
-    AscendC::LocalTensor<half> staged)
+    AscendC::LocalTensor<half> staged,uint32_t active_kv=StackKv)
 {
     static_assert(StackKv%SliceKv==0);
-    constexpr size_t elements=StackKv*HeadDim;
+    if(active_kv==0 || active_kv>StackKv || active_kv%SliceKv)
+        throw std::runtime_error("mixed simulator: invalid V prefetch width");
+    const size_t elements=active_kv*HeadDim;
     if(v.length<elements || staged.length<elements)
         throw std::runtime_error("mixed simulator: V prefetch is out of bounds");
     CubeFASim::CountRead(elements);

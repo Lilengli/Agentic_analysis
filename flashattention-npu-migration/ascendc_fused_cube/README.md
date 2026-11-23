@@ -239,3 +239,19 @@ Compare BM128/BN512 with and without `--cross-query` in the same build.
 For an instruction comparison, use a group with at least two query
 blocks, such as S=1536, H=1, 10 groups and core0 (tasks 0 and 10).
 A group with only one query block cannot show the new overlap.
+
+### Trim the causal diagonal stack (BM128/BN512)
+
+`--cross-query --trim-diagonal` runs on the measured fastest cross-query
+schedule. The first KV stack of each query contains the causal boundary.
+Its active width is `query_start % 512 + 128`: 128, 256, 384 or 512 columns.
+Cube only issues QK and PV MMADs for that prefix and prefetches only the
+matching V slices. On the diagonal stack, Vector uses strided DataCopy
+for the same score and P prefix. It retains the 512-column UB layout and
+softmax math, initializing unfilled UB lanes before applying the usual
+row-level causal mask. All older stacks, GM relay strides, and flags
+are unchanged.
+
+For S=16384, each head processes 8448 physical 128-token slices without
+trimming and 8256 with trimming, a 2.27% reduction in QK/PV slice count.
+Benchmark both modes with `--cross-query` enabled to isolate trimming.

@@ -141,7 +141,22 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
 }
 
-template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
+// Keep the full-width score and P layout while transferring only the visible
+// column prefix of each row. DataCopyParams strides are in 32-byte blocks.
+template<uint32_t Rows,uint32_t BN,class T,class Dst,class Src>
+__aicore__ inline void CopyStackPrefix(Dst dst,Src src,uint32_t active_kv)
+{
+    constexpr uint32_t ElementsPerBlock=32/sizeof(T);
+    if(active_kv==BN) {
+        AscendC::DataCopy(dst,src,Rows*BN);
+    } else {
+        const uint16_t blocks=active_kv/ElementsPerBlock;
+        const uint16_t gap=(BN-active_kv)/ElementsPerBlock;
+        AscendC::DataCopy(dst,src,AscendC::DataCopyParams(Rows,blocks,gap,gap));
+    }
+}
+
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask,bool TrimDiagonal=false>
 __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC::GlobalTensor<half> pgm,
     AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p, AscendC::LocalTensor<half> alternate_p,
     AscendC::LocalTensor<float> partial0, AscendC::LocalTensor<float> partial1,
@@ -149,7 +164,7 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> maxB,
     AscendC::LocalTensor<float> sumA, AscendC::LocalTensor<float> sumB,
     AscendC::LocalTensor<float> row_blocks, AscendC::LocalTensor<uint32_t> mask,
-    uint32_t gm_slot,uint32_t pv_slot,uint32_t sub,AscendC::TPipe& pipe)
+    uint32_t gm_slot,uint32_t pv_slot,uint32_t sub,AscendC::TPipe& pipe,uint32_t active_kv=BN)
 {
     AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
     if constexpr(BN!=512) {
@@ -163,15 +178,26 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
         using G=Geometry<2*Rows,BN>;
         constexpr uint32_t BatchRows=G::BatchRows, Elements=G::BatchElements;
         static_assert(Rows==4*BatchRows);
+        if constexpr(TrimDiagonal) {
+            static_assert(ApplyCausalMask);
+            // Unwritten columns must be initialized before vector arithmetic.
+            // The softmax mask keeps these lanes at zero after each reuse.
+            if(active_kv<BN) AscendC::Duplicate(s,0.0f,UbScoreSlots*Elements);
+        }
         Sync<AscendC::HardEvent::V_MTE2>(pipe);
-        AscendC::DataCopy(s,scores,Elements);
+        if constexpr(TrimDiagonal) CopyStackPrefix<BatchRows,BN,float>(s,scores,active_kv);
+        else AscendC::DataCopy(s,scores,Elements);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         for(uint32_t batch=0;batch<Rows/BatchRows;++batch) {
             const uint32_t slot=batch%2, row=batch*BatchRows;
             const int32_t score_event=slot==0 ? 0 : 3;
             if(batch+1<Rows/BatchRows) {
                 if(batch>0) Sync<AscendC::HardEvent::V_MTE2>(pipe);
-                AscendC::DataCopy(s[(slot^1)*Elements],scores[(batch+1)*Elements],Elements);
+                if constexpr(TrimDiagonal)
+                    CopyStackPrefix<BatchRows,BN,float>(s[(slot^1)*Elements],
+                        scores[(batch+1)*Elements],active_kv);
+                else
+                    AscendC::DataCopy(s[(slot^1)*Elements],scores[(batch+1)*Elements],Elements);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(slot==0 ? 3 : 0);
             }
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(score_event);
@@ -186,7 +212,9 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
             CompleteSoftmax<BatchRows,BN>(scores_ub,batch_p,batch_m,l[row],alpha[row],
                 batch_max,sumA,sumB,row_blocks,partial);
             Sync<AscendC::HardEvent::V_MTE3>(pipe);
-            AscendC::DataCopy(pgm[(pv_slot*2+sub)*Rows*BN+batch*Elements],batch_p,Elements);
+            auto pdst=pgm[(pv_slot*2+sub)*Rows*BN+batch*Elements];
+            if constexpr(TrimDiagonal) CopyStackPrefix<BatchRows,BN,half>(pdst,batch_p,active_kv);
+            else AscendC::DataCopy(pdst,batch_p,Elements);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(slot);
         }
         // Each row slice wrote to the alternate running-max buffer.
@@ -199,13 +227,14 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false>
+template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,bool TrimDiagonal=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
     static_assert(!PrefetchV || (BM==128 && BN==512));
     static_assert(!CrossQuery || PrefetchV);
+    static_assert(!TrimDiagonal || (BM==128 && BN==512 && CrossQuery));
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -256,12 +285,14 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint64_t base=uint64_t(head)*seq*D;
             constexpr int32_t step=BN;
             const int32_t first_key=(qs/BN)*BN;
+            const uint32_t diagonal_kv=TrimDiagonal ? qs%BN+BM : BN;
             uint32_t slot=0, issued_pv=0;
             for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
                 if (qk_key>=0) {
                     const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
-                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                    const uint32_t qk_kv=qk_key==first_key ? diagonal_kv : BN;
+                    for(uint32_t kv=0;kv<qk_kv;kv+=CubeKv) {
                         Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+(uint64_t(qk_key)+kv)*D],
                             sgm[score_offset+kv],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
                             BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
@@ -274,10 +305,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
                 const uint32_t pv_slot=issued_pv%PvRelaySlots;
+                const uint32_t pv_kv=pv_key==first_key ? diagonal_kv : BN;
                 auto pv_bl=bl;
                 if constexpr(PrefetchV) {
                     pv_bl=pvVB.template Get<half>();
-                    PrefetchPvV<CubeKv,D,BN>(pipe,vgm[base+uint64_t(pv_key)*D],pv_bl);
+                    PrefetchPvV<CubeKv,D,BN>(pipe,vgm[base+uint64_t(pv_key)*D],pv_bl,pv_kv);
                 }
                 if constexpr(CrossQuery) {
                     if(pending_pv & (1u<<pv_slot))
@@ -287,13 +319,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 }
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
                 // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
-                for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                for(uint32_t kv=0;kv<pv_kv;kv+=CubeKv) {
                     auto pv_slice=pv_bl;
                     if constexpr(PrefetchV) pv_slice=pv_bl[kv*D];
                     Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
                         dgm[pv_slot*BM*D],pl,pv_slice,a0,b0,c0[accum_slot*L0CSlotElements],
                         BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
-                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN,!PrefetchV);
+                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==pv_kv,!PrefetchV);
                 }
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
@@ -360,8 +392,9 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareTile<R,BN,true>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
-                m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe);
+            const uint32_t diagonal_kv=TrimDiagonal ? qs%BN+BM : BN;
+            PrepareTile<R,BN,true,TrimDiagonal>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
+                m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe,diagonal_kv);
             uint32_t prepared=1;
             for(uint32_t tile=0;tile<kv_tiles;++tile) {
                 const uint32_t pv_slot=tile%PvRelaySlots;
@@ -409,13 +442,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false>
+template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,bool TrimDiagonal=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery,TrimDiagonal>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

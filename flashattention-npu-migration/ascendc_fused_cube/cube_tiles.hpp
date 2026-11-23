@@ -20,7 +20,7 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
 // dependency covers the prefetched V as well as the subsequent P copy.
 template<uint32_t SliceKv,uint32_t HeadDim,uint32_t StackKv>
 __aicore__ inline void PrefetchPvV(AscendC::TPipe& pipe,AscendC::GlobalTensor<half> v,
-    AscendC::LocalTensor<half> staged)
+    AscendC::LocalTensor<half> staged,uint32_t active_kv=StackKv)
 {
     using B=Catlass::Gemm::GemmType<half,Catlass::layout::RowMajor>;
     using Copy=Catlass::Gemm::Tile::CopyGmToL1<Catlass::Arch::AtlasA2,B>;
@@ -28,7 +28,7 @@ __aicore__ inline void PrefetchPvV(AscendC::TPipe& pipe,AscendC::GlobalTensor<ha
     auto layout=Layout::template MakeLayout<half>(SliceKv,HeadDim);
     // Prior PV may still be reading this staging area on MTE1.
     Sync<AscendC::HardEvent::MTE1_MTE2>(pipe);
-    for(uint32_t kv=0;kv<StackKv;kv+=SliceKv)
+    for(uint32_t kv=0;kv<active_kv;kv+=SliceKv)
         Copy{}(staged[kv*HeadDim],v[kv*HeadDim],layout,
             Catlass::layout::RowMajor(SliceKv,HeadDim));
 }
