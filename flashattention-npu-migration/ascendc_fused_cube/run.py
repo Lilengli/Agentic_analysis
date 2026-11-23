@@ -31,6 +31,8 @@ def main():
                    help='start the next query QK before draining the previous PV relay slots')
     p.add_argument('--trim-diagonal', action='store_true',
                    help='skip wholly masked KV slices in the diagonal stack (requires --cross-query)')
+    p.add_argument('--vector-normalize', action='store_true',
+                   help='batch final output normalization with vector division (requires --trim-diagonal)')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
     p.add_argument('--warmup', type=int, default=1)
@@ -55,6 +57,8 @@ def main():
         p.error('--cross-query requires BM128/BN512 with V prefetch')
     if a.trim_diagonal and not a.cross_query:
         p.error('--trim-diagonal requires --cross-query')
+    if a.vector_normalize and not a.trim_diagonal:
+        p.error('--vector-normalize requires --trim-diagonal')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
@@ -71,6 +75,8 @@ def main():
     implementation['pv_v_load_order'] = 'before P_READY' if prefetch_v else 'after P_READY'
     implementation['query_pipeline'] = 'overlap QK with previous PV tail' if a.cross_query else 'drain each query'
     implementation['diagonal_stack'] = 'trim wholly masked KV slices' if a.trim_diagonal else 'full width'
+    implementation['output_normalization'] = (
+        'broadcast denominator and vector divide' if a.vector_normalize else 'per-row reciprocal and scale')
     print('implementation:', implementation, flush=True)
     from verify_products import run_checks
     run_checks()
@@ -80,7 +86,7 @@ def main():
 
     def call():
         return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks, prefetch_v, a.cross_query,
-                                      a.trim_diagonal)
+                                      a.trim_diagonal, a.vector_normalize)
 
     def verify(out, label):
         # Copy only sampled outputs for CPU FP32 comparison. All values in all
@@ -176,7 +182,7 @@ def main():
               'torch_version': torch.__version__, 'torch_npu_version': getattr(torch_npu,'__version__','unknown'), 'correct': True, 'checks': checks, 'query_rows_checked': indices.tolist(),
               'block_m': a.block_m, 'block_n': a.block_n, 'blocks': a.blocks,
               'prefetch_pv_v': prefetch_v, 'cross_query': a.cross_query,
-              'trim_diagonal': a.trim_diagonal,
+              'trim_diagonal': a.trim_diagonal, 'vector_normalize': a.vector_normalize,
               'gm_relay_bytes': a.blocks * implementation[f'gm_relay_bytes_per_group_bm{a.block_m}_bn{a.block_n}'],
               'implementation': implementation, 'wall_ms': wall_ms, 'event_us': event_us,
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,

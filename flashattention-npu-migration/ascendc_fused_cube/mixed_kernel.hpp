@@ -227,7 +227,8 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,bool TrimDiagonal=false>
+template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,
+    bool TrimDiagonal=false,bool VectorNormalize=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
@@ -235,6 +236,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     static_assert(!PrefetchV || (BM==128 && BN==512));
     static_assert(!CrossQuery || PrefetchV);
     static_assert(!TrimDiagonal || (BM==128 && BN==512 && CrossQuery));
+    static_assert(!VectorNormalize || TrimDiagonal);
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -430,8 +432,18 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 AscendC::CrossCoreSetFlag<0x2,PIPE_V>(RelayFlag(TILE_DONE,pv_slot));
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            Sync<AscendC::HardEvent::V_S>(pipe);
-            for(uint32_t r=0;r<R;++r) AscendC::Muls(out[r*D],out[r*D],1.0f/l.GetValue(r),D);
+            if constexpr(VectorNormalize) {
+                // Each Div repeat normalizes 64 columns of one row using its broadcast denominator.
+                AscendC::Brcb(row_blocks,l,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::PipeBarrier<PIPE_V>();
+                for(uint32_t col=0;col<D;col+=Fp32Repeat) {
+                    AscendC::Div(out[col],out[col],row_blocks,uint64_t{Fp32Repeat},R,
+                        AscendC::BinaryRepeatParams(1,1,0,D/Fp32Block,D/Fp32Block,1));
+                }
+            } else {
+                Sync<AscendC::HardEvent::V_S>(pipe);
+                for(uint32_t r=0;r<R;++r) AscendC::Muls(out[r*D],out[r*D],1.0f/l.GetValue(r),D);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(oh,out,AscendC::RoundMode::CAST_RINT,R*D);
             Sync<AscendC::HardEvent::V_MTE3>(pipe);
@@ -442,13 +454,15 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,bool TrimDiagonal=false>
+template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,
+    bool TrimDiagonal=false,bool VectorNormalize=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery,TrimDiagonal>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery,TrimDiagonal,VectorNormalize>(
+        q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

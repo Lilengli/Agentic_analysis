@@ -14,12 +14,14 @@ namespace {
 constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
-template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
+template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
+    bool TrimDiagonal=false, bool VectorNormalize=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(q, k, v, out, relay, masks, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(
+        q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -60,7 +62,8 @@ std::vector<uint64_t> ExpectedKvPrefix(uint32_t group, uint32_t groups,
     return prefix;
 }
 
-template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
+template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
+    bool TrimDiagonal=false, bool VectorNormalize=false>
 void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
@@ -168,9 +171,12 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV reduction calls do not match the score tile width");
         Require(av->max_calls == iterations * batches * (BN == 128 ? 2 : 1),
             "AIV must update the running maxima as vectors");
-        Require(av->brcb_calls == (batches + 1) * iterations &&
+        Require(av->brcb_calls == (batches + 1) * iterations + (VectorNormalize ? tasks : 0) &&
                     av->sub_calls == iterations * batches * (1 + BN / 64),
-            "AIV must broadcast both the updated maxima and the output rescale factors");
+            "AIV broadcast or centering count is incorrect");
+        Require(av->div_calls == (VectorNormalize ? tasks * (CubeFA::D / 64) : 0) &&
+                    av->muls_calls == batches * iterations + (VectorNormalize ? 0 : tasks * R),
+            "AIV output normalization did not use the expected vector or per-row path");
         Require(av->mul_calls == mul_calls_per_tile * iterations && av->exp_calls == 2 * batches * iterations,
             "AIV online-softmax vector operation counts are incorrect");
         Require(av->cast_calls == batches * iterations + tasks,
@@ -180,7 +186,8 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     }
 }
 
-template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false, bool TrimDiagonal=false>
+template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
+    bool TrimDiagonal=false, bool VectorNormalize=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -212,7 +219,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -222,7 +229,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -248,7 +255,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     uint64_t total_kv = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
-        CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(
+            group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
         total_iterations += iterations;
         const uint64_t kv_total=ExpectedKvPrefix<BM, BN, TrimDiagonal>(group,groups,heads,seq).back();
@@ -297,8 +305,9 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, seq, heads, groups, repeat, (unsigned long long)total_iterations,
+    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d VectorNormalize=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, seq, heads, groups, repeat,
+        (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
 
@@ -337,6 +346,12 @@ int main(int argc, char** argv) {
             Check<128, 512, true, true, true>(2560, 1, 3, 0);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--vector-normalize") {
+            Check<128, 512, true, true, true, true>(512, 2, 3, 0);
+            Check<128, 512, true, true, true, true>(1536, 1, 10, 0);
+            Check<128, 512, true, true, true, true>(2560, 1, 3, 0);
+            return 0;
+        }
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();
@@ -355,6 +370,9 @@ int main(int argc, char** argv) {
         Check<128, 512, true, true, true>(512, 2, 3, 0);
         Check<128, 512, true, true, true>(1536, 1, 10, 0);
         Check<128, 512, true, true, true>(2560, 1, 3, 0);
+        Check<128, 512, true, true, true, true>(512, 2, 3, 0);
+        Check<128, 512, true, true, true, true>(1536, 1, 10, 0);
+        Check<128, 512, true, true, true, true>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

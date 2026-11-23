@@ -114,6 +114,7 @@ struct Stats {
     uint64_t add_calls = 0;
     uint64_t mul_calls = 0;
     uint64_t muls_calls = 0;
+    uint64_t div_calls = 0;
     uint64_t exp_calls = 0;
     uint64_t p_ready_calls = 0;
     uint64_t cast_calls = 0;
@@ -539,6 +540,11 @@ inline void Mul(LocalTensor<float> destination, LocalTensor<float> a, LocalTenso
         uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
     RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs * rhs; });
     CubeFASim::CountVector(&CubeFASim::Stats::mul_calls);
+}
+inline void Div(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs / rhs; });
+    CubeFASim::CountVector(&CubeFASim::Stats::div_calls);
 }
 template <class T> void Muls(LocalTensor<T> destination, LocalTensor<T> source, T scalar, size_t n) {
     if (n > destination.length || n > source.length) throw std::runtime_error("mixed simulator: Muls out of bounds");

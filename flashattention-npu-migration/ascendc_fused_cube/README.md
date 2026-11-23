@@ -255,3 +255,13 @@ are unchanged.
 For S=16384, each head processes 8448 physical 128-token slices without
 trimming and 8256 with trimming, a 2.27% reduction in QK/PV slice count.
 Benchmark both modes with `--cross-query` enabled to isolate trimming.
+
+### Batch the final output normalization (BM128/BN512)
+
+Add `--vector-normalize` to `--cross-query --trim-diagonal` to compare
+the final AIV output normalization. Each AIV uses its existing UB
+scratch to broadcast the 64 FP32 row denominators, then issues two
+strided vector divisions covering 64 output columns each. Each
+division processes all 64 rows. The result is cast to FP16 and
+written to GM after the divisions. The baseline computes a reciprocal
+and scales the output for each row.
