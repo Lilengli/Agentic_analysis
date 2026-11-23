@@ -15,12 +15,12 @@ constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
 template<int Core, unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
-    bool TrimDiagonal=false, bool VectorNormalize=false>
+    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(
+    CubeFA::RunCore<Core, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
         q, k, v, out, relay, masks, heads, seq, groups);
 }
 
@@ -28,32 +28,24 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-uint64_t AssignedTasks(uint32_t group, uint32_t groups, uint64_t task_count) {
-    uint64_t count = 0;
-    for (uint64_t task = group; task < task_count; task += groups) ++count;
-    return count;
-}
-
-template<unsigned BM, unsigned BN>
-uint64_t ExpectedIterations(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq) {
-    const uint32_t tiles = seq / BM;
-    const uint64_t task_count = uint64_t(heads) * tiles;
-    uint64_t count = 0;
-    for (uint64_t task = group; task < task_count; task += groups) {
-        const uint32_t qs = uint32_t(task % tiles) * BM;
-        count += qs / BN + 1;
+std::vector<uint32_t> ExpectedQueryTasks(
+        uint32_t group, uint32_t groups, uint32_t task_count, bool balance_queries) {
+    std::vector<uint32_t> query_tasks;
+    for (uint32_t task = 0; task < task_count; ++task) {
+        uint32_t owner = task % groups;
+        if (balance_queries && (task / groups) % 2 != 0) owner = groups - 1 - owner;
+        if (owner == group) query_tasks.push_back(task);
     }
-    return count;
+    return query_tasks;
 }
 
 template<unsigned BM, unsigned BN, bool TrimDiagonal>
-std::vector<uint64_t> ExpectedKvPrefix(uint32_t group, uint32_t groups,
-        uint32_t heads, uint32_t seq)
+std::vector<uint64_t> ExpectedKvPrefix(const std::vector<uint32_t>& query_tasks, uint32_t seq)
 {
     const uint32_t tiles=seq/BM;
     std::vector<uint64_t> prefix{0};
-    for(uint64_t task=group;task<uint64_t(heads)*tiles;task+=groups) {
-        const uint32_t qs=uint32_t(task%tiles)*BM;
+    for(uint32_t task : query_tasks) {
+        const uint32_t qs=(task%tiles)*BM;
         for(uint32_t tile=0;tile<=qs/BN;++tile) {
             const uint32_t width=TrimDiagonal && tile==0 ? qs%BN+BM : BN;
             prefix.push_back(prefix.back()+width);
@@ -64,7 +56,8 @@ std::vector<uint64_t> ExpectedKvPrefix(uint32_t group, uint32_t groups,
 
 template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
     bool TrimDiagonal=false, bool VectorNormalize=false>
-void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
+void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32_t seq,
+        const std::vector<uint64_t>& kv_prefix,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
     using G = CubeFA::Geometry<BM, BN>;
@@ -73,18 +66,17 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     constexpr uint32_t MaxN = MaxK;
     constexpr uint64_t batches = R / G::BatchRows;
     constexpr uint64_t reductions_per_tile = batches * (BN == 512 ? 3 : (BN / 64) * 2);
-    const uint64_t tasks = AssignedTasks(group, groups, uint64_t(heads) * (seq / BM));
-    const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
+    const uint64_t tasks = query_tasks.size();
+    const uint64_t iterations = kv_prefix.size() - 1;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending{};
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending_before_done{};
     std::vector<uint64_t> expected_prepared_at_pv_wait;
     const uint32_t query_tiles = seq / BM;
     uint64_t prepared = 0, trimmed_tasks=0;
-    const auto kv_prefix=ExpectedKvPrefix<BM, BN, TrimDiagonal>(group,groups,heads,seq);
     const uint64_t kv_total=kv_prefix.back();
     std::array<bool, CubeFA::PvRelaySlots> pending_pv{};
-    for (uint64_t task = group; task < uint64_t(heads) * query_tiles; task += groups) {
-        const uint32_t qs=uint32_t(task%query_tiles)*BM;
+    for (uint32_t task : query_tasks) {
+        const uint32_t qs=(task%query_tiles)*BM;
         const uint32_t kv_tiles=qs/BN+1;
         if constexpr(TrimDiagonal) trimmed_tasks+=qs%BN+BM<BN;
         for (uint32_t remaining = kv_tiles; remaining > 0; --remaining) {
@@ -187,7 +179,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
 }
 
 template<unsigned BM, unsigned BN, bool PrefetchV=false, bool CrossQuery=false,
-    bool TrimDiagonal=false, bool VectorNormalize=false>
+    bool TrimDiagonal=false, bool VectorNormalize=false, bool BalanceQueries=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -219,7 +211,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
+                    group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -229,7 +222,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries>(
+                        group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -255,11 +249,12 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     uint64_t total_kv = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
+        const auto query_tasks = ExpectedQueryTasks(group, groups, heads * (seq / BM), BalanceQueries);
+        const auto kv_prefix = ExpectedKvPrefix<BM, BN, TrimDiagonal>(query_tasks, seq);
         CheckStats<BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize>(
-            group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
-        const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
-        total_iterations += iterations;
-        const uint64_t kv_total=ExpectedKvPrefix<BM, BN, TrimDiagonal>(group,groups,heads,seq).back();
+            group, query_tasks, seq, kv_prefix, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        total_iterations += kv_prefix.size() - 1;
+        const uint64_t kv_total=kv_prefix.back();
         total_kv+=kv_total;
         total_mmad_calls += aic_stats[group].mmad_calls;
         total_output_writes += aiv0_stats[group].gm_write_elements - kv_total * (BM / 2);
@@ -305,8 +300,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d VectorNormalize=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, seq, heads, groups, repeat,
+    std::printf("PASS BM=%u BN=%u PrefetchV=%d CrossQuery=%d TrimDiagonal=%d VectorNormalize=%d BalanceQueries=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PrefetchV, CrossQuery, TrimDiagonal, VectorNormalize, BalanceQueries, seq, heads, groups, repeat,
         (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
@@ -318,6 +313,44 @@ void CheckShape() {
             for (unsigned groups : {1u, 3u})
                 for (unsigned repeat : {0u, 1u})
                     Check<BM, BN>(seq, heads, groups, repeat);
+}
+
+void CheckBalancedQueries() {
+    for (uint32_t groups = 1; groups <= 24; ++groups) {
+        for (uint32_t count = 1; count <= 3 * groups + 1; ++count) {
+            for (uint32_t group = 0; group < groups; ++group) {
+                std::vector<uint32_t> actual;
+                for (CubeFA::QueryAssignment<true> assignment{groups, group};
+                        assignment.Task() < count; assignment.Advance())
+                    actual.push_back(static_cast<uint32_t>(assignment.Task()));
+                Require(actual == ExpectedQueryTasks(group, groups, count, true),
+                    "incorrect balanced query assignment, including partial waves");
+            }
+        }
+    }
+    std::vector<uint32_t> slices, stacks;
+    for (uint32_t group = 0; group < 24; ++group) {
+        uint32_t group_slices = 0, group_stacks = 0;
+        for (CubeFA::QueryAssignment<true> assignment{24, group};
+                assignment.Task() < 256; assignment.Advance()) {
+            const uint32_t tile = static_cast<uint32_t>(assignment.Task()) % 128;
+            group_slices += tile + 1;
+            group_stacks += tile / 4 + 1;
+        }
+        slices.push_back(group_slices);
+        stacks.push_back(group_stacks);
+    }
+    const auto [min_slices, max_slices] = std::minmax_element(slices.begin(), slices.end());
+    const auto [min_stacks, max_stacks] = std::minmax_element(stacks.begin(), stacks.end());
+    Require(*min_slices == 678 && *max_slices == 693 && *min_stacks == 174 && *max_stacks == 177,
+        "incorrect 16K workload distribution");
+    std::printf("PASS balanced assignment for 1..24 groups; 16K slices=%u..%u stacks=%u..%u\n",
+        *min_slices, *max_slices, *min_stacks, *max_stacks);
+
+    Check<128, 512, true, true, true, false, true>(512, 1, 5, 0);
+    Check<128, 512, true, true, true, false, true>(512, 2, 7, 0);
+    Check<128, 512, true, true, true, false, true>(1536, 1, 10, 0);
+    Check<128, 512, true, true, true, true, true>(1024, 2, 3, 0);
 }
 } // namespace
 
@@ -352,6 +385,11 @@ int main(int argc, char** argv) {
             Check<128, 512, true, true, true, true>(2560, 1, 3, 0);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--balance-queries") {
+            CheckBalancedQueries();
+            return 0;
+        }
+        CheckBalancedQueries();
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();

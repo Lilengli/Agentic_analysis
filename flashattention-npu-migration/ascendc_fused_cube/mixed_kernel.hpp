@@ -18,6 +18,21 @@ __aicore__ inline uint16_t RelayFlag(uint16_t flag,uint32_t slot)
     return slot==0 ? flag : RelayExtraBase+(slot-1)*FlagsPerRelaySlot+flag-P_READY;
 }
 
+template<bool BalanceQueries>
+struct QueryAssignment {
+    uint32_t groups, offset;
+    uint64_t wave_base=0;
+
+    __aicore__ inline uint64_t Task() const { return wave_base+offset; }
+
+    __aicore__ inline void Advance()
+    {
+        wave_base+=groups;
+        // Reverse the lanes of odd waves. The mapped task bounds the partial final wave.
+        if constexpr(BalanceQueries) offset=groups-1-offset;
+    }
+};
+
 template<uint32_t R,uint32_t BN>
 __aicore__ inline void PublishP(AscendC::GlobalTensor<half> pgm,AscendC::LocalTensor<half> p,
     uint32_t slot,uint32_t sub,AscendC::TPipe& pipe)
@@ -228,7 +243,7 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
 }
 
 template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,
-    bool TrimDiagonal=false,bool VectorNormalize=false>
+    bool TrimDiagonal=false,bool VectorNormalize=false,bool BalanceQueries=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
@@ -237,6 +252,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     static_assert(!CrossQuery || PrefetchV);
     static_assert(!TrimDiagonal || (BM==128 && BN==512 && CrossQuery));
     static_assert(!VectorNormalize || TrimDiagonal);
+    static_assert(!BalanceQueries || TrimDiagonal);
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -282,7 +298,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         int32_t accum_slot=0;
         // Cross-query mode carries ownership of each PV relay slot across tasks.
         uint32_t pending_pv=0;
-        for(uint32_t task=group;task<tasks;task+=groups) {
+        for(QueryAssignment<BalanceQueries> assignment{groups,group};assignment.Task()<tasks;assignment.Advance()) {
+            const uint32_t task=static_cast<uint32_t>(assignment.Task());
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
             constexpr int32_t step=BN;
@@ -383,7 +400,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
         }
-        for(uint32_t task=group;task<tasks;task+=groups) {
+        for(QueryAssignment<BalanceQueries> assignment{groups,group};assignment.Task()<tasks;assignment.Advance()) {
+            const uint32_t task=static_cast<uint32_t>(assignment.Task());
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
             AscendC::Duplicate(out,0.0f,R*D);
@@ -455,13 +473,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 
 #ifndef CUBE_FA_CPU_SIM
 template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false,
-    bool TrimDiagonal=false,bool VectorNormalize=false>
+    bool TrimDiagonal=false,bool VectorNormalize=false,bool BalanceQueries=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery,TrimDiagonal,VectorNormalize>(
+    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery,TrimDiagonal,VectorNormalize,BalanceQueries>(
         q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif

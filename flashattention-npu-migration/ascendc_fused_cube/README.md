@@ -265,3 +265,15 @@ strided vector divisions covering 64 output columns each. Each
 division processes all 64 rows. The result is cast to FP16 and
 written to GM after the divisions. The baseline computes a reciprocal
 and scales the output for each row.
+
+### Balance query work across AIC groups
+
+Add `--balance-queries` to `--cross-query --trim-diagonal`. Even waves
+of query tiles go to groups in ascending order, and odd waves go in
+descending order. Cube and both Vector subcores use the same mapping,
+including for the partially filled last wave. Each group keeps its
+own GM relay slots and writes each query to its original output rows.
+
+For S=16384, two heads and 24 groups, the predicted physical KV slice
+counts go from 610–768 per group to 678–693. Compare with the flag off
+using the same tile, diagonal trimming and normalization settings.
