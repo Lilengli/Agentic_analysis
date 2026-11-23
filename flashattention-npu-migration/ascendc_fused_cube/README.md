@@ -205,3 +205,39 @@ python -u run.py --seq 16384 --heads 2 --block-m 128 --block-n 512 \
   --seeds 1234 4321 --rows 64 --warmup 3 --repeat 5 \
   --output generated_16k_bm128_bn512.json
 ```
+
+### Early PV experiment: 32 query rows × 32 output features
+
+With BM128/BN512, `--pv-row32` enables an alternate PV schedule in the same
+extension. Each AIV still computes four 16×512 softmax batches. It publishes
+the existing P relay flag after its first two batches, then again after its
+last two. Each wait on Cube consumes one notification from each AIV. The first
+wait makes rows 0–31 and 64–95 readable; the second makes rows 32–63 and 96–127
+readable. The intermediate still goes through GM.
+
+Cube keeps two 32×512 P blocks in L0A (64 KiB total) and uses two 512×32 V
+slots in L0B (64 KiB total). Each V block serves two P blocks; all four V
+feature blocks stay packed in L1 so the second tranche can reuse them without
+loading V from GM again. Each 32×32 FP32 output uses a separate L0C region
+within its tranche and Fixpipe writes it to its row and feature offset in the
+existing stride-128 PV relay. Vector still waits for the whole PV stack before
+consuming it. The experiment trades four PV MMADs and one PV Fixpipe for
+sixteen PV MMADs and sixteen smaller PV Fixpipe transfers. The transferred
+output payload is 64 KiB in either path.
+
+Build once and compare with and without `--pv-row32` at the same shape.
+Use the no-profiler event median for performance and verify sampled outputs
+in both runs. The CPU semantic simulator checks the two notification rounds,
+the slice offsets, ring reuse, and numerical output; only an NPU trace can
+confirm the amount of load/compute overlap.
+
+```bash
+python build.py
+for mode in baseline row32; do
+  args=()
+  if [ "$mode" = row32 ]; then args+=(--pv-row32); fi
+  python -u run.py --seq 16384 --batch 1 --heads 2 --blocks 24 \
+    --block-m 128 --block-n 512 --rows 64 --seeds 1234 4321 \
+    --warmup 3 --repeat 9 --output "generated_16k_bn512_pv_${mode}.json" "${args[@]}"
+done
+```

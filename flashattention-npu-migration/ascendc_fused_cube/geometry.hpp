@@ -3,6 +3,7 @@
 
 namespace CubeFA {
 constexpr uint32_t D=128;
+constexpr uint32_t PvRowTile=32, PvFeatureTile=32, PvFullKv=512, PvBSlots=2;
 // Bound the QK work that can sit ahead of a ready PV on the same pipelines.
 constexpr uint32_t ScoreSlots=4;
 constexpr uint32_t QkLookaheadTiles=ScoreSlots-1;

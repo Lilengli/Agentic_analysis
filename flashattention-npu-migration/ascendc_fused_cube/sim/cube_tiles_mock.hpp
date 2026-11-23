@@ -119,6 +119,7 @@ struct Stats {
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_done_waits{};
     std::vector<PvWaitSnapshot> pv_waits;
+    std::vector<uint64_t> p_ready_mmad_count;
     std::array<size_t, 5> local_bytes_by_position{};
 };
 
@@ -138,7 +139,7 @@ struct FlagState {
     std::mutex mutex;
     std::condition_variable changed;
     std::array<uint64_t, kFlagCount> broadcasts{};
-    std::array<uint64_t, kFlagCount> arrivals{};
+    std::array<std::array<uint64_t, kFlagCount>, kAivCount> arrivals{};
     bool aborted = false;
 };
 inline std::mutex groups_mutex;
@@ -148,6 +149,7 @@ inline uintptr_t workspace_begin = 0;
 inline uintptr_t workspace_end = 0;
 inline size_t workspace_stride = 0;
 inline uint32_t workspace_groups = 0;
+inline uint32_t p_pulses_per_stack = 1;
 
 inline void SetContext(uint32_t group, Core core, uint32_t sub, Stats* stats) {
     context = Context{};
@@ -192,7 +194,7 @@ inline void SetFlag(uint32_t flag) {
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         if (context.core == Core::AIC) ++state.broadcasts[flag];
-        else ++state.arrivals[flag];
+        else ++state.arrivals[context.sub][flag];
     }
     state.changed.notify_all();
 }
@@ -226,17 +228,18 @@ inline void WaitFlag(uint32_t flag) {
             const uint64_t sent = state.broadcasts[CubeFA::QK_READY] + state.broadcasts[CubeFA::QK_ODD_READY];
             uint64_t consumed = 0;
             for (unsigned slot = 0; slot < CubeFA::PvRelaySlots; ++slot)
-                consumed += context.waited_arrivals[RelayFlag(CubeFA::P_READY, slot)];
+                consumed += context.waited_arrivals[RelayFlag(CubeFA::P_READY, slot)] / p_pulses_per_stack;
             const uint64_t pending = sent - consumed;
             if (pending > CubeFA::ScoreSlots || (p_ready && pending == 0))
                 throw std::runtime_error("mixed simulator: score queue depth out of bounds");
             auto& counts = p_ready ? context.stats->pending_qk_at_p_waits
                                    : context.stats->pending_qk_at_done_waits;
             ++counts[pending];
+            if (p_ready) context.stats->p_ready_mmad_count.push_back(context.stats->mmad_calls);
         }
-        const uint64_t target = (context.waited_arrivals[flag] + 1) * kAivCount;
+        const uint64_t target = context.waited_arrivals[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
-                return state.aborted || state.arrivals[flag] >= target;
+                return state.aborted || (state.arrivals[0][flag] >= target && state.arrivals[1][flag] >= target);
             })) {
             state.aborted = true;
             state.changed.notify_all();
@@ -540,7 +543,7 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
         ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0,
-        uint32_t c_stride = 0, bool init_c = true, bool store_c = true) {
+        uint32_t c_stride = 0, bool init_c = true, bool store_c = true, bool read_inputs = true) {
     if constexpr (DoubleBufferedL0C) {
         const size_t slot_bytes = l0c.owner->size() / 2;
         if (l0c.offset != size_t(l0c_slot) * slot_bytes || size_t(m) * n * sizeof(float) > slot_bytes)
@@ -561,7 +564,7 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
     if (a.length < last_a || b.length < last_b || c.length < output_extent ||
         l0c.length < size_t(m) * n)
         throw std::runtime_error("mixed simulator: GEMM operand or output out of bounds");
-    CubeFASim::CountRead(size_t(m) * k + size_t(k) * n);
+    if (read_inputs) CubeFASim::CountRead(size_t(m) * k + size_t(k) * n);
     for (uint32_t i = 0; i < m; ++i) {
         for (uint32_t j = 0; j < n; ++j) {
             float sum = 0.0f;
@@ -581,6 +584,30 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         }
         if constexpr (DoubleBufferedL0C) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+        }
+    }
+}
+
+template<bool LoadV>
+__aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
+    AscendC::GlobalTensor<half> p, AscendC::GlobalTensor<half> v,
+    AscendC::GlobalTensor<float> dst, AscendC::LocalTensor<half> l1p,
+    AscendC::LocalTensor<half> l1v, AscendC::LocalTensor<half> l0a,
+    AscendC::LocalTensor<half> l0b, AscendC::LocalTensor<float> l0c,
+    uint32_t l0c_slot_elements)
+{
+    constexpr uint32_t M=PvRowTile, N=PvFeatureTile, K=PvFullKv;
+    if (l1p.length < 2*M*K || l0a.length < 2*M*K || l1v.length < K*D || l0b.length < PvBSlots*K*N)
+        throw std::runtime_error("mixed simulator: PV stripe does not fit Cube operand buffers");
+    CubeFASim::CountRead(2*M*K + (LoadV ? K*D : 0));
+    for(uint32_t col=0;col<D;col+=N) {
+        for(uint32_t sub=0;sub<2;++sub) {
+            if(col==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            Gemm(pipe,p[sub*2*M*K],v[col],dst[sub*2*M*D+col],l1p,l1v,l0a,l0b,
+                l0c[sub*l0c_slot_elements+(col/N)*M*N], M,N,K,
+                Catlass::layout::RowMajor(M,K),Catlass::layout::RowMajor(K,N,D),
+                true,0,D,true,true,false);
+            if(col+N==D) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
         }
     }
 }

@@ -141,7 +141,7 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
 }
 
-template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask,bool PvRow32=false>
 __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC::GlobalTensor<half> pgm,
     AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p, AscendC::LocalTensor<half> alternate_p,
     AscendC::LocalTensor<float> partial0, AscendC::LocalTensor<float> partial1,
@@ -188,6 +188,13 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
             Sync<AscendC::HardEvent::V_MTE3>(pipe);
             AscendC::DataCopy(pgm[(pv_slot*2+sub)*Rows*BN+batch*Elements],batch_p,Elements);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(slot);
+            if constexpr(PvRow32) {
+                static_assert(2*BatchRows==PvRowTile && Rows==2*PvRowTile);
+                // Pulse the slot's P_READY after each 32-row tranche. Both AIVs
+                // publish in the same order; the Cube consumes exactly two pulses.
+                if(row+BatchRows==PvRowTile)
+                    AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(RelayFlag(P_READY,pv_slot));
+            }
         }
         // Each row slice wrote to the alternate running-max buffer.
         auto previous_m=m;
@@ -199,11 +206,12 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN>
+template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
+    static_assert(!PvRow32 || (BM==128 && BN==PvFullKv));
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -231,10 +239,16 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         AscendC::TBuf<AscendC::TPosition::B2> b0B;
         AscendC::TBuf<AscendC::TPosition::CO1> c0B;
         pipe.InitBuffer(qB,BM*D*sizeof(half));
-        pipe.InitBuffer(pB,BM*CubeKv*sizeof(half));
-        pipe.InitBuffer(bB,CubeKv*D*sizeof(half));
-        pipe.InitBuffer(a0B,BM*MaxK*sizeof(half));
-        pipe.InitBuffer(b0B,CubeKv*D*sizeof(half));
+        constexpr uint32_t L1P=PvRow32 ? 2*PvRowTile*BN : BM*CubeKv;
+        constexpr uint32_t L1B=PvRow32 ? BN*D : CubeKv*D;
+        constexpr uint32_t L0A=PvRow32 ? 2*PvRowTile*BN : BM*MaxK;
+        constexpr uint32_t L0B=PvRow32 ? PvBSlots*BN*PvFeatureTile : CubeKv*D;
+        static_assert((BM*D+L1P+L1B)*sizeof(half)<=512*1024);
+        static_assert(L0A*sizeof(half)<=64*1024 && L0B*sizeof(half)<=64*1024);
+        pipe.InitBuffer(pB,L1P*sizeof(half));
+        pipe.InitBuffer(bB,L1B*sizeof(half));
+        pipe.InitBuffer(a0B,L0A*sizeof(half));
+        pipe.InitBuffer(b0B,L0B*sizeof(half));
         pipe.InitBuffer(c0B,2*L0CSlotElements*sizeof(float));
         auto ql=qB.template Get<half>(); auto pl=pB.template Get<half>(); auto bl=bB.template Get<half>();
         auto a0=a0B.template Get<half>(); auto b0=b0B.template Get<half>(); auto c0=c0B.template Get<float>();
@@ -268,14 +282,24 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 const uint32_t pv_slot=issued_pv%PvRelaySlots;
                 if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
-                for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
-                    Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
-                        dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
-                        BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
-                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
+                if constexpr(PvRow32) {
+                    auto pv=vgm[base+uint64_t(pv_key)*D];
+                    auto pslot=pgm[pv_slot*BM*BN];
+                    auto dslot=dgm[pv_slot*BM*D];
+                    PvFeatureStripe<true>(pipe,pslot,pv,dslot,pl,bl,a0,b0,c0,L0CSlotElements);
+                    AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
+                    PvFeatureStripe<false>(pipe,pslot[PvRowTile*BN],pv,dslot[PvRowTile*D],
+                        pl,bl,a0,b0,c0,L0CSlotElements);
+                } else {
+                    // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
+                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                        Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
+                            dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                            BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
+                            Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
+                    }
+                    accum_slot^=1;
                 }
-                accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
                 ++issued_pv;
             }
@@ -330,7 +354,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareTile<R,BN,true>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
+            PrepareTile<R,BN,true,PvRow32>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
                 m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe);
             uint32_t prepared=1;
             for(uint32_t tile=0;tile<kv_tiles;++tile) {
@@ -355,7 +379,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                         next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
                     }
                     // The previous PV from this slot was consumed before reusing its P and alpha.
-                    PrepareTile<R,BN,false>(sgm[next_score_offset+score_row_offset],pgm,next_s,next_p,
+                    PrepareTile<R,BN,false,PvRow32>(sgm[next_score_offset+score_row_offset],pgm,next_s,next_p,
                         oh,partial0,partial1,m,l,alpha[next_slot*R],maxA,maxB,sumA,sumB,row_blocks,
                         masks,gm_slot,next_slot,sub,pipe);
                 }
@@ -379,13 +403,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN>
+template<uint32_t BM,uint32_t BN,bool PvRow32=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PvRow32>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

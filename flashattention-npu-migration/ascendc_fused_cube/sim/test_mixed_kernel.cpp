@@ -11,15 +11,20 @@
 #include <vector>
 
 namespace {
+template<unsigned BM, unsigned BN, bool PvRow32>
+constexpr uint64_t MmadPerStack = BN / CubeFA::Geometry<BM, BN>::CubeKv +
+    (PvRow32 ? (BM / CubeFA::PvRowTile) * (CubeFA::D / CubeFA::PvFeatureTile)
+             : BN / CubeFA::Geometry<BM, BN>::CubeKv);
+
 constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
-template<int Core, unsigned BM, unsigned BN>
+template<int Core, unsigned BM, unsigned BN, bool PvRow32=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN>(q, k, v, out, relay, masks, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN, PvRow32>(q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -44,7 +49,7 @@ uint64_t ExpectedIterations(uint32_t group, uint32_t groups, uint32_t heads, uin
     return count;
 }
 
-template<unsigned BM, unsigned BN>
+template<unsigned BM, unsigned BN, bool PvRow32=false>
 void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
@@ -52,6 +57,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     constexpr uint32_t R = G::Rows;
     constexpr uint32_t MaxK = G::CubeKv > CubeFA::D ? G::CubeKv : CubeFA::D;
     constexpr uint32_t MaxN = MaxK;
+    constexpr uint64_t p_pulses = PvRow32 ? 2 : 1;
     constexpr uint64_t batches = R / G::BatchRows;
     constexpr uint64_t reductions_per_tile = batches * (BN == 512 ? 3 : (BN / 64) * 2);
     const uint64_t tasks = AssignedTasks(group, groups, uint64_t(heads) * (seq / BM));
@@ -65,6 +71,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const uint32_t kv_tiles = uint32_t(task % query_tiles) * BM / BN + 1;
         for (uint32_t remaining = kv_tiles; remaining > 0; --remaining) {
             ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
+            if constexpr (PvRow32) ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
         }
         for (uint32_t tile = CubeFA::PvRelaySlots; tile < kv_tiles; ++tile)
             ++expected_pending_before_done[
@@ -79,23 +86,38 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
-    Require(aic.mmad_calls == 2 * iterations * (BN / G::CubeKv),
+    Require(aic.mmad_calls == iterations * MmadPerStack<BM, BN, PvRow32>,
         "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
+    if constexpr (PvRow32) {
+        const uint64_t qk_reads = (BN / G::CubeKv) * (BM * CubeFA::D + G::CubeKv * CubeFA::D);
+        const uint64_t pv_reads = BM * BN + BN * CubeFA::D;
+        Require(aic.gm_read_elements == iterations * (qk_reads + pv_reads),
+            "AIC must load each P and V element once per PV stack");
+        Require(aic.p_ready_mmad_count.size() == 2 * iterations,
+            "AIC must receive two probability tranches per stack");
+        for (size_t i = 0; i < aic.p_ready_mmad_count.size(); i += 2)
+            Require(aic.p_ready_mmad_count[i+1] - aic.p_ready_mmad_count[i] ==
+                    2 * CubeFA::D / CubeFA::PvFeatureTile,
+                "first PV tranche must be computed before waiting for the second");
+    }
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
         "AIC score/delta workspace write count is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A1)] ==
-                uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * G::CubeKv * 2 +
-                uint64_t(G::CubeKv) * CubeFA::D * 2,
+                2 * (uint64_t(BM) * CubeFA::D +
+                (PvRow32 ? 2 * CubeFA::PvRowTile * BN : BM * G::CubeKv) +
+                (PvRow32 ? BN : G::CubeKv) * CubeFA::D),
         "AIC A1 buffer sizes do not match the mixed schedule");
-    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] == uint64_t(BM) * MaxK * 2,
+    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] == 2 * (PvRow32 ? 2 * CubeFA::PvRowTile * BN : BM * MaxK),
         "AIC A2 buffer size is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::B2)] ==
-                uint64_t(G::CubeKv) * CubeFA::D * 2,
+                2 * (PvRow32 ? CubeFA::PvBSlots * BN * CubeFA::PvFeatureTile : G::CubeKv * CubeFA::D),
         "AIC B2 buffer size is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::CO1)] == 2 * uint64_t(BM) * MaxN * 4,
         "AIC CO1 buffer size is incorrect");
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
+        Require(av->p_ready_calls == iterations * p_pulses,
+            "AIV probability notification count is incorrect");
         constexpr uint64_t mul_calls_per_tile = batches + CubeFA::D / 64;
         const uint64_t mask_reads = tasks ? CubeFA::MaskWordsPerAiv(BN) : 0;
         Require(av->reads_before_first_qk == mask_reads,
@@ -107,7 +129,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         for (size_t i = 0; i < av->pv_waits.size(); ++i) {
             const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
             const auto& snapshot = av->pv_waits[i];
-            Require(snapshot.p_ready_calls == scores_prepared,
+            Require(snapshot.p_ready_calls == scores_prepared * p_pulses,
                 "AIV must publish its full probability lookahead before waiting for the current PV");
             Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
@@ -140,7 +162,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     }
 }
 
-template<unsigned BM, unsigned BN>
+template<unsigned BM, unsigned BN, bool PvRow32=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -157,6 +179,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::vector<uint8_t> relay(kGuardBytes + size_t(groups) * G::RelayBytes + kGuardBytes, kRelayGuard);
     GM_ADDR relay_base = relay.data() + kGuardBytes;
     std::fill(relay_base, relay_base + size_t(groups) * G::RelayBytes, uint8_t(0xff));
+    CubeFASim::p_pulses_per_stack = PvRow32 ? 2 : 1;
     CubeFASim::BeginRun(groups, relay_base, G::RelayBytes);
 
     std::vector<CubeFASim::Stats> aic_stats(groups), aiv0_stats(groups), aiv1_stats(groups);
@@ -172,7 +195,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PvRow32>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -182,7 +205,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PvRow32>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -204,14 +227,14 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     uint64_t total_mmad_calls = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
-        CheckStats<BM, BN>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        CheckStats<BM, BN, PvRow32>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
         total_iterations += iterations;
         total_mmad_calls += aic_stats[group].mmad_calls;
         total_output_writes += aiv0_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
         total_output_writes += aiv1_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
     }
-    Require(total_mmad_calls == 2 * total_iterations * (BN / G::CubeKv),
+    Require(total_mmad_calls == total_iterations * MmadPerStack<BM, BN, PvRow32>,
         "total AIC Mmad count does not match the QK and PV slices");
     Require(total_output_writes == elements, "output work partition left rows unwritten or wrote rows more than once");
 
@@ -251,8 +274,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, seq, heads, groups, repeat, (unsigned long long)total_iterations,
+    std::printf("PASS BM=%u BN=%u PvRow32=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PvRow32, seq, heads, groups, repeat, (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
 
@@ -273,6 +296,11 @@ int main(int argc, char** argv) {
             std::puts("PASS mixed AIC/AIV CPU semantic smoke case");
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--pv-row32") {
+            Check<128, 512, true>(512, 2, 3, 0);
+            Check<128, 512, true>(2560, 1, 3, 0);
+            return 0;
+        }
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();
@@ -282,6 +310,8 @@ int main(int argc, char** argv) {
         Check<32, 64>(640, 1, 3, 0);
         Check<128, 512>(512, 2, 3, 0);
         Check<128, 512>(2560, 1, 3, 0);
+        Check<128, 512, true>(512, 2, 3, 0);
+        Check<128, 512, true>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

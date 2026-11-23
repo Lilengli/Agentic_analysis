@@ -1,5 +1,6 @@
 // Own orchestration; CATLASS supplies documented A2 layout/copy/Mmad primitives.
 #pragma once
+#include "geometry.hpp"
 #include "kernel_operator.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/coord.hpp"
@@ -67,6 +68,85 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
         if constexpr (DoubleBufferedL0C) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
         }
+    }
+}
+
+// One 32-row tranche from each AIV. P stays in L0A for all four
+// feature tiles. Each B tile serves both AIV row blocks before its slot is reused.
+template<bool LoadV>
+__aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
+    AscendC::GlobalTensor<half> p, AscendC::GlobalTensor<half> v,
+    AscendC::GlobalTensor<float> dst, AscendC::LocalTensor<half> l1p,
+    AscendC::LocalTensor<half> l1v, AscendC::LocalTensor<half> l0a,
+    AscendC::LocalTensor<half> l0b, AscendC::LocalTensor<float> l0c,
+    uint32_t l0c_slot_elements)
+{
+    constexpr uint32_t M=PvRowTile, N=PvFeatureTile, K=PvFullKv;
+    constexpr uint32_t PElements=M*K, VElements=K*N;
+    constexpr uint32_t Features=D/N;
+    static_assert(Features==4 && PvBSlots==2);
+    using Arch=Catlass::Arch::AtlasA2;
+    using HalfRM=Catlass::Gemm::GemmType<half,Catlass::layout::RowMajor>;
+    using FloatRM=Catlass::Gemm::GemmType<float,Catlass::layout::RowMajor>;
+    using Copies=Catlass::Gemm::Tile::TileCopy<Arch,HalfRM,HalfRM,FloatRM>;
+    using AL1=typename Copies::CopyGmToL1A::LayoutDst;
+    using BL1=typename Copies::CopyGmToL1B::LayoutDst;
+    using AL0=typename Copies::CopyL1ToL0A::LayoutDst;
+    using BL0=typename Copies::CopyL1ToL0B::LayoutDst;
+    auto al1=AL1::template MakeLayout<half>(M,K);
+    auto bl1=BL1::template MakeLayout<half>(K,N);
+    auto al0=AL0::template MakeLayout<half>(M,K);
+    auto bl0=BL0::template MakeLayout<half>(K,N);
+    auto cl0=Catlass::layout::zN::MakeLayoutInL0C(Catlass::MakeCoord(M,N));
+    const uint32_t aiv_row_stride=2*M;
+
+    // The QK path and consecutive PV calls share these L1 and L0 allocations.
+    Sync<AscendC::HardEvent::MTE1_MTE2>(pipe);
+    for(uint32_t sub=0;sub<2;++sub)
+        typename Copies::CopyGmToL1A{}(l1p[sub*PElements],p[sub*aiv_row_stride*K],
+            al1,Catlass::layout::RowMajor(M,K));
+    Sync<AscendC::HardEvent::MTE2_MTE1>(pipe);
+    Sync<AscendC::HardEvent::M_MTE1>(pipe);
+    for(uint32_t sub=0;sub<2;++sub)
+        typename Copies::CopyL1ToL0A{}(l0a[sub*PElements],l1p[sub*PElements],al0,al1);
+
+    const int32_t ready[2]={
+        static_cast<int32_t>(pipe.AllocEventID<AscendC::HardEvent::MTE1_M>()),
+        static_cast<int32_t>(pipe.AllocEventID<AscendC::HardEvent::MTE1_M>())};
+    const int32_t released[2]={
+        static_cast<int32_t>(pipe.AllocEventID<AscendC::HardEvent::M_MTE1>()),
+        static_cast<int32_t>(pipe.AllocEventID<AscendC::HardEvent::M_MTE1>())};
+    for(uint32_t feature=0;feature<Features;++feature) {
+        const uint32_t col=feature*N, slot=feature%PvBSlots;
+        if constexpr(LoadV) {
+            typename Copies::CopyGmToL1B{}(l1v[feature*VElements],v[col],bl1,
+                Catlass::layout::RowMajor(K,N,D));
+            Sync<AscendC::HardEvent::MTE2_MTE1>(pipe);
+        }
+        if(feature>=PvBSlots)
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(released[slot]);
+        auto b=l0b[slot*VElements];
+        typename Copies::CopyL1ToL0B{}(b,l1v[feature*VElements],bl0,bl1);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(ready[slot]);
+
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(ready[slot]);
+        for(uint32_t sub=0;sub<2;++sub) {
+            auto c=l0c[sub*l0c_slot_elements+feature*M*N];
+            if(feature==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            Catlass::Gemm::Tile::TileMmad<Arch,HalfRM,HalfRM,void>{}(
+                c,l0a[sub*PElements],b,M,N,K);
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(sub);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(sub);
+            typename Copies::CopyL0CToGm{}(dst[sub*aiv_row_stride*D+col],c,
+                Catlass::layout::RowMajor(M,N,D),cl0);
+            if(feature+1==Features) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
+        }
+        if(feature+PvBSlots<Features)
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(released[slot]);
+    }
+    for(uint32_t slot=0;slot<PvBSlots;++slot) {
+        pipe.ReleaseEventID<AscendC::HardEvent::MTE1_M>(ready[slot]);
+        pipe.ReleaseEventID<AscendC::HardEvent::M_MTE1>(released[slot]);
     }
 }
 
