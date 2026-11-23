@@ -539,35 +539,49 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
-        ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0) {
+        ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0,
+        uint32_t c_stride = 0, bool init_c = true, bool store_c = true) {
     if constexpr (DoubleBufferedL0C) {
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
         const size_t slot_bytes = l0c.owner->size() / 2;
         if (l0c.offset != size_t(l0c_slot) * slot_bytes || size_t(m) * n * sizeof(float) > slot_bytes)
             throw std::runtime_error("mixed simulator: L0C tensor does not match its slot");
+        if (init_c) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
     }
     if (a_layout.rows != m || a_layout.cols != k || b_layout.rows != k || b_layout.cols != n)
         throw std::runtime_error("mixed simulator: GEMM layout does not match its dimensions");
+    const size_t stride = c_stride ? c_stride : n;
+    if (stride < n)
+        throw std::runtime_error("mixed simulator: GEMM output stride is smaller than its column count");
     if (a.offset % 32 || b.offset % 32 || c.offset % 32 ||
         (size_t(m) * n * sizeof(float)) % 32)
         throw std::runtime_error("mixed simulator: GEMM operand/output alignment is invalid");
     const size_t last_a = a_layout.Offset(m - 1, k - 1) + 1;
     const size_t last_b = b_layout.Offset(k - 1, n - 1) + 1;
-    if (a.length < last_a || b.length < last_b || c.length < size_t(m) * n)
+    const size_t output_extent = size_t(m - 1) * stride + n;
+    if (a.length < last_a || b.length < last_b || c.length < output_extent ||
+        l0c.length < size_t(m) * n)
         throw std::runtime_error("mixed simulator: GEMM operand or output out of bounds");
     CubeFASim::CountRead(size_t(m) * k + size_t(k) * n);
-    CubeFASim::CountWrite(c.data, size_t(m) * n, sizeof(float));
     for (uint32_t i = 0; i < m; ++i) {
         for (uint32_t j = 0; j < n; ++j) {
             float sum = 0.0f;
             for (uint32_t x = 0; x < k; ++x)
                 sum += float(a.data[a_layout.Offset(i, x)]) * float(b.data[b_layout.Offset(x, j)]);
-            c.data[size_t(i) * n + j] = sum;
+            const size_t local_index = size_t(i) * n + j;
+            if (!init_c) sum += l0c.GetValue(local_index);
+            l0c.SetValue(local_index, sum);
         }
     }
     CubeFASim::CountMmad();
-    if constexpr (DoubleBufferedL0C) {
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+    if (store_c) {
+        for (uint32_t i = 0; i < m; ++i) {
+            CubeFASim::CountWrite(c.data + size_t(i) * stride, n, sizeof(float));
+            for (uint32_t j = 0; j < n; ++j)
+                c.data[size_t(i) * stride + j] = l0c.GetValue(size_t(i) * n + j);
+        }
+        if constexpr (DoubleBufferedL0C) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+        }
     }
 }
 } // namespace CubeFA

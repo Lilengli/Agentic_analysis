@@ -36,7 +36,8 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(q.scalar_type()==at::kHalf && k.scalar_type()==at::kHalf && v.scalar_type()==at::kHalf,"FP16 required");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),"contiguous tensors required");
     TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(),"forward inference only");
-    TORCH_CHECK((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn,"BM32/64/128 BN64/128, BM<=BN required");
+    TORCH_CHECK(((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn) ||
+        (bm==128 && bn==512),"BM32/64/128 BN64/128 with BM<=BN, or experimental BM128/BN512 required");
     TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 && q.size(2)%bn==0 && q.size(3)==128,"S<=16384 divisible by BN and D128 required");
     TORCH_CHECK(groups>0 && groups<=24,"groups must be 1..24");
     const int64_t heads=q.size(0)*q.size(1);
@@ -61,7 +62,8 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     else if(bm==32 && bn==128) CubeFA::fused_cube_attention<32,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(bm==128 && bn==128) CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else CubeFA::fused_cube_attention<128,512><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     return out;
 }
 
@@ -96,6 +98,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_relay_bytes_per_group_bm64_bn64"]=CubeFA::Geometry<64,64>::RelayBytes;
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
+        d["gm_relay_bytes_per_group_bm128_bn512"]=CubeFA::Geometry<128,512>::RelayBytes;
         d["gm_intermediates"]="FP32 score ring, three FP16 probability slots and three FP32 PV slots per group";
         d["gm_score_slots"]=CubeFA::ScoreSlots;
         d["gm_pv_slots"]=CubeFA::PvRelaySlots;
@@ -106,6 +109,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["online_max_update"]="vector Max/Sub with alternating UB views";
         d["score_row_max"]="two-stage BlockReduceMax";
         d["score_row_sum"]="two-stage BlockReduceSum";
+        d["stack512_score_row_reductions"]="three-stage BlockReduceMax and BlockReduceSum";
+        d["stack512_vector_batch_rows"]=CubeFA::Geometry<128,512>::BatchRows;
+        d["stack512_cube_kv_per_mmad"]=CubeFA::Geometry<128,512>::CubeKv;
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=CubeFA::PvRelaySlots-1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";

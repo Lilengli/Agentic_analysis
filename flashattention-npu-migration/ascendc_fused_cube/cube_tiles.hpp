@@ -22,7 +22,7 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     AscendC::LocalTensor<half> lb, AscendC::LocalTensor<half> l0a,
     AscendC::LocalTensor<half> l0b, AscendC::LocalTensor<float> l0c,
     uint32_t m,uint32_t n,uint32_t k,ALayout a_layout,BLayout b_layout,bool load_a=true,
-    int32_t l0c_slot=0)
+    int32_t l0c_slot=0,uint32_t c_stride=0,bool init_c=true,bool store_c=true)
 {
     using Arch=Catlass::Arch::AtlasA2;
     using AT=Catlass::Gemm::GemmType<half,ALayout>;
@@ -46,22 +46,27 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     typename Copies::CopyL1ToL0A{}(l0a,la,al0,al1);
     typename Copies::CopyL1ToL0B{}(l0b,lb,bl0,bl1);
     Sync<AscendC::HardEvent::MTE1_M>(pipe);
-    if constexpr (DoubleBufferedL0C) {
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
-    } else {
-        Sync<AscendC::HardEvent::FIX_M>(pipe);
+    if (init_c) {
+        if constexpr (DoubleBufferedL0C) {
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+        } else {
+            Sync<AscendC::HardEvent::FIX_M>(pipe);
+        }
     }
     // TileMmad lowers directly to AscendC::Mmad (AIC Cube), FP32 accumulation.
-    Catlass::Gemm::Tile::TileMmad<Arch,AT,BT,void>{}(l0c,l0a,l0b,m,n,k,true);
-    if constexpr (DoubleBufferedL0C) {
-        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
-        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
-    } else {
-        Sync<AscendC::HardEvent::M_FIX>(pipe);
-    }
-    typename Copies::CopyL0CToGm{}(c,l0c,Catlass::layout::RowMajor(m,n),cl0);
-    if constexpr (DoubleBufferedL0C) {
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+    Catlass::Gemm::Tile::TileMmad<Arch,AT,BT,void>{}(l0c,l0a,l0b,m,n,k,init_c);
+    if (store_c) {
+        if constexpr (DoubleBufferedL0C) {
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+        } else {
+            Sync<AscendC::HardEvent::M_FIX>(pipe);
+        }
+        const uint32_t stride = c_stride ? c_stride : n;
+        typename Copies::CopyL0CToGm{}(c,l0c,Catlass::layout::RowMajor(m,n,stride),cl0);
+        if constexpr (DoubleBufferedL0C) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+        }
     }
 }
 

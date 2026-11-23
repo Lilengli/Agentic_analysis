@@ -72,7 +72,9 @@ P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
 steady interval between PV_READY events and the whole call time.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
-S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
+S divisible by BN and up to 16384; BM32/64/128 with BM<=BN and BN64/128, plus
+the experimental BM128/BN512 path, 1..24 AIC groups. The experimental path
+requires S divisible by 512. No GQA,
 dropout, variable-length tails or backward.
 
 ## Build and run on the target
@@ -129,9 +131,11 @@ compilation, products, repeated mixed runs and MAC counters remain necessary.
 The semantic suite covers all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. It also checks S512 with
 BM128/BN128 and S640 with BM32/BN64, including a full score ring and wraparound.
+BM128/BN512 runs at S512 and S2560 to cover all four causal alignments and
+reuse of both relay rings.
 It checks the score ring depth, PV relay reuse waits, and compares results
 against an independent FP64 causal reference with atol=.002 and rtol=.01.
-Other checks cover two matrix products per KV iteration,
+Other checks cover the number of QK and PV MMADs and the logical GM writes,
 both-AIV flag participation, repeated relay reuse, bounds/alignment, and UB
 allocation accounting. They do not validate full 16K or real-device behavior.
 
@@ -169,3 +173,35 @@ python run.py --seq 16384 --heads 2 --block-m 128 --block-n 128 --seeds 1234 432
 compare `*_GM_to_L1_datas`, `*_L0C_to_GM_datas`, `*_GM_to_UB_datas` and
 `*_UB_to_GM_datas` alongside the time. A run must pass all verification checks.
 MemoryAccess availability and collected fields depend on torch_npu and CANN.
+
+### Experimental BM128 logical 512-token stack
+
+The `--block-m 128 --block-n 512` experiment increases the logical KV stack
+processed by each softmax/PV handoff to 512 tokens while keeping each Cube QK
+slice at 128 columns. For one logical stack, Cube produces four 128x128 QK
+products. For PV, it accumulates four 128x128 MMADs into the same L0C result and
+does one Fixpipe only after all four products. This reduces PV relay handoffs
+from four per 512 KV tokens to one.
+
+Each AIV handles 64 of the 128 query rows in four 16x512 score chunks. The
+score and P buffers ping-pong between those chunks, and row reductions use
+three stages over the 512 columns. Explicit UB allocation is 184,576 bytes
+per AIV plus the 8 KiB Select workspace. The implementation
+retains four QK score slots in GM and the triple P/PV relay. Every diagonal
+logical stack is processed in full and then causally masked, so sequence length
+must be a multiple of 512. This path is experimental and needs target correctness,
+profiling and timing validation. The default remains BM64/BN128.
+
+For BM128/BN512, the relay formula accounts for four FP32 score slots and three
+FP16 P plus FP32 PV slots:
+`4 * 128 * 512 * 4 + 3 * (128 * 512 * 2 + 128 * 128 * 4)` bytes =
+**1600 KiB per group**, or **37.5 MiB for 24 groups**. The ordinary standalone
+product probes stay at their physical tile sizes; the mixed forward path checks
+every output dimension on the selected query rows against the CPU reference.
+
+```bash
+python build.py
+python -u run.py --seq 16384 --heads 2 --block-m 128 --block-n 512 \
+  --seeds 1234 4321 --rows 64 --warmup 3 --repeat 5 \
+  --output generated_16k_bm128_bn512.json
+```

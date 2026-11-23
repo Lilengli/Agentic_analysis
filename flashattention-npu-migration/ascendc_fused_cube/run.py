@@ -20,7 +20,7 @@ def main():
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--heads', type=int, default=2)
     p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
-    p.add_argument('--block-n', type=int, choices=(64, 128), default=128)
+    p.add_argument('--block-n', type=int, choices=(64, 128, 512), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
@@ -31,9 +31,13 @@ def main():
     p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
     a = p.parse_args()
+    supported_tile = ((a.block_m in (32, 64, 128) and a.block_n in (64, 128)
+                       and a.block_m <= a.block_n)
+                      or (a.block_m == 128 and a.block_n == 512))
     if not (0 < a.seq <= 16384 and a.seq % a.block_n == 0 and 0 < a.blocks <= 24
-            and a.block_m <= a.block_n and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
-        p.error('invalid shape/count: require 0<S<=16384 divisible by BN, groups 1..24, positive counts')
+            and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
+        p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
+                'or experimental BM128/BN512; S must be divisible by BN, groups 1..24, counts positive')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):

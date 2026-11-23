@@ -50,8 +50,10 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& av1) {
     using G = CubeFA::Geometry<BM, BN>;
     constexpr uint32_t R = G::Rows;
-    constexpr uint32_t MaxK = BN > CubeFA::D ? BN : CubeFA::D;
+    constexpr uint32_t MaxK = G::CubeKv > CubeFA::D ? G::CubeKv : CubeFA::D;
     constexpr uint32_t MaxN = MaxK;
+    constexpr uint64_t batches = R / G::BatchRows;
+    constexpr uint64_t reductions_per_tile = batches * (BN == 512 ? 3 : (BN / 64) * 2);
     const uint64_t tasks = AssignedTasks(group, groups, uint64_t(heads) * (seq / BM));
     const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending{};
@@ -77,22 +79,24 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
-    Require(aic.mmad_calls == 2 * iterations,
-        "AIC group " + std::to_string(group) + " did not issue exactly two Mmad products per KV tile");
+    Require(aic.mmad_calls == 2 * iterations * (BN / G::CubeKv),
+        "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
         "AIC score/delta workspace write count is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A1)] ==
-                uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * BN * 2 + uint64_t(BN) * CubeFA::D * 2,
+                uint64_t(BM) * CubeFA::D * 2 + uint64_t(BM) * G::CubeKv * 2 +
+                uint64_t(G::CubeKv) * CubeFA::D * 2,
         "AIC A1 buffer sizes do not match the mixed schedule");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::A2)] == uint64_t(BM) * MaxK * 2,
         "AIC A2 buffer size is incorrect");
-    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::B2)] == uint64_t(BN) * CubeFA::D * 2,
+    Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::B2)] ==
+                uint64_t(G::CubeKv) * CubeFA::D * 2,
         "AIC B2 buffer size is incorrect");
     Require(aic.local_bytes_by_position[unsigned(AscendC::TPosition::CO1)] == 2 * uint64_t(BM) * MaxN * 4,
         "AIC CO1 buffer size is incorrect");
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
-        constexpr uint64_t mul_calls_per_tile = 1 + CubeFA::D / 64;
+        constexpr uint64_t mul_calls_per_tile = batches + CubeFA::D / 64;
         const uint64_t mask_reads = tasks ? CubeFA::MaskWordsPerAiv(BN) : 0;
         Require(av->reads_before_first_qk == mask_reads,
             "AIV must load its packed mask before the first QK wait");
@@ -107,31 +111,32 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
                 "AIV must publish its full probability lookahead before waiting for the current PV");
             Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
-            Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,
+            Require(snapshot.block_reduce_max_calls == scores_prepared * reductions_per_tile,
                 "AIV did not reduce the next score before waiting for PV");
-            Require(snapshot.exp_calls == 2 * scores_prepared &&
-                    snapshot.block_reduce_sum_calls == scores_prepared * (BN / 64) * 2,
+            Require(snapshot.exp_calls == 2 * batches * scores_prepared &&
+                    snapshot.block_reduce_sum_calls == scores_prepared * reductions_per_tile,
                 "AIV must finish the next softmax before waiting for PV");
-            Require(snapshot.mul_calls == scores_prepared + (i + 1) * (CubeFA::D / 64),
+            Require(snapshot.mul_calls == batches * scores_prepared + (i + 1) * (CubeFA::D / 64),
                 "AIV must rescale the denominator and output before waiting for PV");
         }
         Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),
             "AIV mask/score/delta GM read count is incorrect");
         Require(av->gm_write_elements == iterations * uint64_t(R) * BN + tasks * uint64_t(R) * CubeFA::D,
             "AIV probability/output GM write count is incorrect");
-        const uint64_t reduce_calls = iterations * (BN / 64);
-        Require(av->block_reduce_max_calls == 2 * reduce_calls && av->block_reduce_sum_calls == 2 * reduce_calls,
+        const uint64_t reduce_calls = iterations * reductions_per_tile;
+        Require(av->block_reduce_max_calls == reduce_calls && av->block_reduce_sum_calls == reduce_calls,
             "AIV reduction calls do not match the score tile width");
-        Require(av->max_calls == iterations * (BN == 128 ? 2 : 1),
-            "AIV must combine the split maxima and update the running maxima as vectors");
-        Require(av->brcb_calls == 2 * iterations && av->sub_calls == iterations * (1 + BN / 64),
+        Require(av->max_calls == iterations * batches * (BN == 128 ? 2 : 1),
+            "AIV must update the running maxima as vectors");
+        Require(av->brcb_calls == (batches + 1) * iterations &&
+                    av->sub_calls == iterations * batches * (1 + BN / 64),
             "AIV must broadcast both the updated maxima and the output rescale factors");
-        Require(av->mul_calls == mul_calls_per_tile * iterations && av->exp_calls == 2 * iterations,
+        Require(av->mul_calls == mul_calls_per_tile * iterations && av->exp_calls == 2 * batches * iterations,
             "AIV online-softmax vector operation counts are incorrect");
-        Require(av->cast_calls == iterations + tasks,
+        Require(av->cast_calls == batches * iterations + tasks,
             "AIV probability or output conversion count is incorrect");
-        Require(av->duplicate_calls == 3 * tasks && av->select_calls == tasks,
-            "AIV must initialize online state and select the packed mask once per query tile");
+        Require(av->duplicate_calls == 3 * tasks && av->select_calls == batches * tasks,
+            "AIV must initialize online state and select the packed mask per diagonal batch");
     }
 }
 
@@ -206,7 +211,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         total_output_writes += aiv0_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
         total_output_writes += aiv1_stats[group].gm_write_elements - iterations * (BM / 2) * BN;
     }
-    Require(total_mmad_calls == 2 * total_iterations, "total AIC Mmad count is not two products per KV tile");
+    Require(total_mmad_calls == 2 * total_iterations * (BN / G::CubeKv),
+        "total AIC Mmad count does not match the QK and PV slices");
     Require(total_output_writes == elements, "output work partition left rows unwritten or wrote rows more than once");
 
     double max_error = 0.0;
@@ -274,6 +280,8 @@ int main(int argc, char** argv) {
         CheckShape<128, 128>();
         Check<128, 128>(512, 1, 3, 0);
         Check<32, 64>(640, 1, 3, 0);
+        Check<128, 512>(512, 2, 3, 0);
+        Check<128, 512>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

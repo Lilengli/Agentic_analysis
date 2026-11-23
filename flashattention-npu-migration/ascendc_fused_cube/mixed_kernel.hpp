@@ -1,4 +1,4 @@
-// Own mixed AIC/AIV schedule. Two Mmad products per KV tile, no vector GEMM.
+// Own mixed AIC/AIV schedule. Cube owns QK and PV, Vector owns softmax.
 #pragma once
 #include "geometry.hpp"
 #ifdef CUBE_FA_CPU_SIM
@@ -50,17 +50,32 @@ __aicore__ inline void ReduceRowSum64(AscendC::LocalTensor<float> row_sum,
     AscendC::BlockReduceSum(row_sum,partial,Rows/BlockElements,RepeatElements,1,1,8);
 }
 
-template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
-__aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
-    AscendC::GlobalTensor<float> scores, AscendC::LocalTensor<float> maxA,
-    AscendC::LocalTensor<float> maxB, AscendC::LocalTensor<float> row_blocks,
-    uint32_t gm_slot, AscendC::LocalTensor<uint32_t> causal_mask)
+template<bool Sum>
+__aicore__ inline void ReduceFullRepeat(AscendC::LocalTensor<float> dst,
+    AscendC::LocalTensor<float> src,uint32_t repeats)
 {
-    AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
-    AscendC::DataCopy(s,scores,Rows*BN);
-    // Use distinct MTE2_V events for score and PV copies, which can both be queued.
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    if constexpr(Sum) AscendC::BlockReduceSum(dst,src,repeats,64,1,1,8);
+    else AscendC::BlockReduceMax(dst,src,repeats,64,1,1,8);
+}
+
+template<uint32_t Rows,bool Sum>
+__aicore__ inline void ReduceRow512(AscendC::LocalTensor<float> result,
+    AscendC::LocalTensor<float> scores,AscendC::LocalTensor<float> partial64,
+    AscendC::LocalTensor<float> partial8)
+{
+    // Each block reduces eight FP32 values: 512 -> 64 -> 8 -> 1 per row.
+    ReduceFullRepeat<Sum>(partial64,scores,Rows*8);
+    AscendC::PipeBarrier<PIPE_V>();
+    ReduceFullRepeat<Sum>(partial8,partial64,Rows);
+    AscendC::PipeBarrier<PIPE_V>();
+    ReduceFullRepeat<Sum>(result,partial8,Rows/8);
+}
+
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
+__aicore__ inline void TransformScores(AscendC::LocalTensor<float> s, AscendC::LocalTensor<float> maxA,
+    AscendC::LocalTensor<float> maxB, AscendC::LocalTensor<float> row_blocks,
+    AscendC::LocalTensor<uint32_t> causal_mask, AscendC::LocalTensor<float> partial64)
+{
     AscendC::Muls(s,s,0.08838834764831845f,Rows*BN);
     AscendC::PipeBarrier<PIPE_V>();
     if constexpr (ApplyCausalMask) {
@@ -69,12 +84,16 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
         AscendC::PipeBarrier<PIPE_V>();
     }
     // The preceding barrier has released the row-block scratch used by output rescale.
-    ReduceRowMax64<Rows,BN>(maxA,s,row_blocks);
-    if constexpr(BN==128) {
-        AscendC::PipeBarrier<PIPE_V>();
-        ReduceRowMax64<Rows,BN>(maxB,s[64],row_blocks);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Max(maxA,maxA,maxB,Rows);
+    if constexpr(BN==512) {
+        ReduceRow512<Rows,false>(maxA,s,partial64,row_blocks);
+    } else {
+        ReduceRowMax64<Rows,BN>(maxA,s,row_blocks);
+        if constexpr(BN==128) {
+            AscendC::PipeBarrier<PIPE_V>();
+            ReduceRowMax64<Rows,BN>(maxB,s[64],row_blocks);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Max(maxA,maxA,maxB,Rows);
+        }
     }
 }
 
@@ -82,7 +101,8 @@ template<uint32_t R,uint32_t BN>
 __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
     AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> l, AscendC::LocalTensor<float> alpha,
     AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> sumA,
-    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
+    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks,
+    AscendC::LocalTensor<float> partial64)
 {
     constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
     AscendC::PipeBarrier<PIPE_V>();
@@ -105,16 +125,78 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
     AscendC::PipeBarrier<PIPE_V>();
     // The preceding barrier releases the scratch used to broadcast row maxima.
-    ReduceRowSum64<R,BN>(sumA,s,row_blocks);
-    if constexpr(BN==128) {
-        AscendC::PipeBarrier<PIPE_V>();
-        ReduceRowSum64<R,BN>(sumB,s[64],row_blocks);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add(sumA,sumA,sumB,R);
+    if constexpr(BN==512) {
+        ReduceRow512<R,true>(sumA,s,partial64,row_blocks);
+    } else {
+        ReduceRowSum64<R,BN>(sumA,s,row_blocks);
+        if constexpr(BN==128) {
+            AscendC::PipeBarrier<PIPE_V>();
+            ReduceRowSum64<R,BN>(sumB,s[64],row_blocks);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(sumA,sumA,sumB,R);
+        }
     }
     AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
     AscendC::Mul(l,l,alpha,R);
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
+}
+
+template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
+__aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC::GlobalTensor<half> pgm,
+    AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p, AscendC::LocalTensor<half> alternate_p,
+    AscendC::LocalTensor<float> partial0, AscendC::LocalTensor<float> partial1,
+    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> l, AscendC::LocalTensor<float> alpha,
+    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> maxB,
+    AscendC::LocalTensor<float> sumA, AscendC::LocalTensor<float> sumB,
+    AscendC::LocalTensor<float> row_blocks, AscendC::LocalTensor<uint32_t> mask,
+    uint32_t gm_slot,uint32_t pv_slot,uint32_t sub,AscendC::TPipe& pipe)
+{
+    AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
+    if constexpr(BN!=512) {
+        AscendC::DataCopy(s,scores,Rows*BN);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+        TransformScores<Rows,BN,ApplyCausalMask>(s,maxA,maxB,row_blocks,mask,row_blocks);
+        CompleteSoftmax<Rows,BN>(s,p,m,l,alpha,maxA,sumA,sumB,row_blocks,row_blocks);
+        PublishP<Rows,BN>(pgm,p,pv_slot,sub,pipe);
+    } else {
+        using G=Geometry<2*Rows,BN>;
+        constexpr uint32_t BatchRows=G::BatchRows, Elements=G::BatchElements;
+        static_assert(Rows==4*BatchRows);
+        Sync<AscendC::HardEvent::V_MTE2>(pipe);
+        AscendC::DataCopy(s,scores,Elements);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        for(uint32_t batch=0;batch<Rows/BatchRows;++batch) {
+            const uint32_t slot=batch%2, row=batch*BatchRows;
+            const int32_t score_event=slot==0 ? 0 : 3;
+            if(batch+1<Rows/BatchRows) {
+                if(batch>0) Sync<AscendC::HardEvent::V_MTE2>(pipe);
+                AscendC::DataCopy(s[(slot^1)*Elements],scores[(batch+1)*Elements],Elements);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(slot==0 ? 3 : 0);
+            }
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(score_event);
+            // Both the FP32 reduction scratch and FP16 P reuse this batch's output buffer.
+            if(batch>=2) AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(slot);
+            auto scores_ub=s[slot*Elements];
+            auto batch_p=slot==0 ? p : alternate_p;
+            auto partial=slot==0 ? partial0 : partial1;
+            auto batch_m=m[row], batch_max=maxA[row];
+            TransformScores<BatchRows,BN,ApplyCausalMask>(scores_ub,batch_max,maxB,row_blocks,
+                mask[batch*Elements/32],partial);
+            CompleteSoftmax<BatchRows,BN>(scores_ub,batch_p,batch_m,l[row],alpha[row],
+                batch_max,sumA,sumB,row_blocks,partial);
+            Sync<AscendC::HardEvent::V_MTE3>(pipe);
+            AscendC::DataCopy(pgm[(pv_slot*2+sub)*Rows*BN+batch*Elements],batch_p,Elements);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(slot);
+        }
+        // Each row slice wrote to the alternate running-max buffer.
+        auto previous_m=m;
+        m=maxA;
+        maxA=previous_m;
+        AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(RelayFlag(P_READY,pv_slot));
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(1);
+    }
 }
 
 template<int Core,uint32_t BM,uint32_t BN>
@@ -140,7 +222,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     constexpr uint32_t second_score=G::SecondScoreOffset/sizeof(float);
     AscendC::TPipe pipe;
     if constexpr(Core==AscendC::AIC) {
-        constexpr uint32_t MaxK=BN>D?BN:D, MaxN=MaxK;
+        constexpr uint32_t CubeKv=G::CubeKv;
+        constexpr uint32_t MaxK=CubeKv>D?CubeKv:D, MaxN=MaxK;
         constexpr uint32_t L0CSlotElements=BM*MaxN;
         static_assert(2*L0CSlotElements*sizeof(float)<=128*1024);
         AscendC::TBuf<AscendC::TPosition::A1> qB,pB,bB;
@@ -148,10 +231,10 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         AscendC::TBuf<AscendC::TPosition::B2> b0B;
         AscendC::TBuf<AscendC::TPosition::CO1> c0B;
         pipe.InitBuffer(qB,BM*D*sizeof(half));
-        pipe.InitBuffer(pB,BM*BN*sizeof(half));
-        pipe.InitBuffer(bB,BN*D*sizeof(half));
+        pipe.InitBuffer(pB,BM*CubeKv*sizeof(half));
+        pipe.InitBuffer(bB,CubeKv*D*sizeof(half));
         pipe.InitBuffer(a0B,BM*MaxK*sizeof(half));
-        pipe.InitBuffer(b0B,BN*D*sizeof(half));
+        pipe.InitBuffer(b0B,CubeKv*D*sizeof(half));
         pipe.InitBuffer(c0B,2*L0CSlotElements*sizeof(float));
         auto ql=qB.template Get<half>(); auto pl=pB.template Get<half>(); auto bl=bB.template Get<half>();
         auto a0=a0B.template Get<half>(); auto b0=b0B.template Get<half>(); auto c0=c0B.template Get<float>();
@@ -170,11 +253,14 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
                 if (qk_key>=0) {
                     const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
-                    Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(qk_key)*D],
-                        sgm[score_offset],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
-                        BM,BN,D,Catlass::layout::RowMajor(BM,D),Catlass::layout::ColumnMajor(D,BN,D),
-                        qk_key==first_key,accum_slot);
-                    accum_slot^=1;
+                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                        Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+(uint64_t(qk_key)+kv)*D],
+                            sgm[score_offset+kv],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                            BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
+                            Catlass::layout::ColumnMajor(D,CubeKv,D),qk_key==first_key && kv==0,
+                            accum_slot,BN);
+                        accum_slot^=1;
+                    }
                     AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(slot));
                 }
                 // Prime the score queue before the first PV.
@@ -182,9 +268,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 const uint32_t pv_slot=issued_pv%PvRelaySlots;
                 if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                Gemm<true>(pipe,pgm[pv_slot*BM*BN],vgm[base+uint64_t(pv_key)*D],dgm[pv_slot*BM*D],
-                    pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],BM,D,BN,Catlass::layout::RowMajor(BM,BN),
-                    Catlass::layout::RowMajor(BN,D),true,accum_slot);
+                // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
+                for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+                    Gemm<true>(pipe,pgm[pv_slot*BM*BN+kv],vgm[base+(uint64_t(pv_key)+kv)*D],
+                        dgm[pv_slot*BM*D],pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                        BM,D,CubeKv,Catlass::layout::RowMajor(BM,CubeKv,BN),
+                        Catlass::layout::RowMajor(CubeKv,D),true,accum_slot,D,kv==0,kv+CubeKv==BN);
+                }
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
                 ++issued_pv;
@@ -200,12 +290,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         constexpr uint32_t ScoreElements=R*BN;
         constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
         static_assert(R%Fp32Block==0 && BN%Fp32Repeat==0 && D%Fp32Repeat==0);
-        static_assert(BN<=D);  // The final-output staging buffer also holds a P tile.
+        static_assert(G::BatchElements<=R*D);  // The final-output staging buffer also holds a P batch.
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
-        pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float));
-        pipe.InitBuffer(pB,(PvRelaySlots-1)*ScoreElements*sizeof(half));
+        pipe.InitBuffer(sB,UbScoreSlots*G::BatchElements*sizeof(float));
+        pipe.InitBuffer(pB,G::PBufferSlots*G::BatchElements*sizeof(half));
         pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,PvRelaySlots*R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
@@ -214,6 +304,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         pipe.InitBuffer(rowMaxBlockB,G::BroadcastBytes);
         auto score_ub=sB.template Get<float>(); auto p=pB.template Get<half>();
         auto delta=dB.template Get<float>(); auto out=oB.template Get<float>(); auto oh=ohB.template Get<half>();
+        auto partial0=pB.template Get<float>(); auto partial1=ohB.template Get<float>();
         auto m=mB.template Get<float>(); auto l=lB.template Get<float>(); auto alpha=alphaB.template Get<float>();
         auto maxA=maxAB.template Get<float>(); auto maxB=maxBB.template Get<float>();
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
@@ -239,10 +330,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,0,
-                masks[mask_offset]);
-            CompleteSoftmax<R,BN>(score_ub,p,m,l,alpha,maxA,sumA,sumB,row_blocks);
-            PublishP<R,BN>(pgm,p,0,sub,pipe);
+            PrepareTile<R,BN,true>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
+                m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe);
             uint32_t prepared=1;
             for(uint32_t tile=0;tile<kv_tiles;++tile) {
                 const uint32_t pv_slot=tile%PvRelaySlots;
@@ -259,13 +348,16 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     const uint32_t gm_slot=prepared%ScoreSlots;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
                     const uint32_t next_slot=prepared%PvRelaySlots;
-                    auto next_s=score_ub[(prepared%UbScoreSlots)*ScoreElements];
+                    auto next_s=score_ub;
+                    auto next_p=p;
+                    if constexpr(BN!=512) {
+                        next_s=score_ub[(prepared%UbScoreSlots)*ScoreElements];
+                        next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
+                    }
                     // The previous PV from this slot was consumed before reusing its P and alpha.
-                    auto next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
-                    PrepareScoreTile<R,BN,false>(next_s,sgm[next_score_offset+score_row_offset],
-                        maxA,maxB,row_blocks,gm_slot,masks);
-                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha[next_slot*R],maxA,sumA,sumB,row_blocks);
-                    PublishP<R,BN>(pgm,next_p,next_slot,sub,pipe);
+                    PrepareTile<R,BN,false>(sgm[next_score_offset+score_row_offset],pgm,next_s,next_p,
+                        oh,partial0,partial1,m,l,alpha[next_slot*R],maxA,maxB,sumA,sumB,row_blocks,
+                        masks,gm_slot,next_slot,sub,pipe);
                 }
                 AscendC::CrossCoreWaitFlag(RelayFlag(PV_READY,pv_slot));
                 AscendC::DataCopy(delta,dgm[pv_slot*BM*D+sub*R*D],R*D);
