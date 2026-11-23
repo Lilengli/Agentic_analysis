@@ -206,12 +206,13 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false>
+template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
     static_assert(!PvRow32 || (BM==128 && BN==PvFullKv));
+    static_assert(!BatchFix || PvRow32);
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -286,10 +287,26 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     auto pv=vgm[base+uint64_t(pv_key)*D];
                     auto pslot=pgm[pv_slot*BM*BN];
                     auto dslot=dgm[pv_slot*BM*D];
-                    PvFeatureStripe<true>(pipe,pslot,pv,dslot,pl,bl,a0,b0,c0,L0CSlotElements);
-                    AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
-                    PvFeatureStripe<false>(pipe,pslot[PvRowTile*BN],pv,dslot[PvRowTile*D],
-                        pl,bl,a0,b0,c0,L0CSlotElements);
+                    if constexpr(BatchFix) {
+                        constexpr uint32_t Stripe=PvBatchFixLayout::StripeElements;
+                        static_assert(4*Stripe==L0CSlotElements);
+                        auto pv_c0=c0[accum_slot*L0CSlotElements];
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(accum_slot);
+                        // NZ tiles in row-major tile order: first pass fills stripes
+                        // 0 and 2, second pass fills 1 and 3. No stripe is overwritten.
+                        PvFeatureStripe<true,true>(pipe,pslot,pv,dslot,
+                            pl,bl,a0,b0,pv_c0,2*Stripe);
+                        AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
+                        PvFeatureStripe<false,true>(pipe,pslot[PvRowTile*BN],pv,dslot[Stripe],
+                            pl,bl,a0,b0,pv_c0[Stripe],2*Stripe);
+                        StorePvRow32Batched(dslot,pv_c0,accum_slot);
+                        accum_slot^=1;
+                    } else {
+                        PvFeatureStripe<true>(pipe,pslot,pv,dslot,pl,bl,a0,b0,c0,L0CSlotElements);
+                        AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
+                        PvFeatureStripe<false>(pipe,pslot[PvRowTile*BN],pv,dslot[PvRowTile*D],
+                            pl,bl,a0,b0,c0,L0CSlotElements);
+                    }
                 } else {
                     // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
                     for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
@@ -403,13 +420,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PvRow32=false>
+template<uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PvRow32>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PvRow32,BatchFix>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA

@@ -241,3 +241,20 @@ for mode in baseline row32; do
     --warmup 3 --repeat 9 --output "generated_16k_bn512_pv_${mode}.json" "${args[@]}"
 done
 ```
+
+#### Four PV Fixpipe calls per stack
+
+Use `--pv-row32-batch-fix` to keep the same row32 handoff and 16 PV MMADs
+while batching the output stores. Each MMAD writes its own compact 32×32 NZ
+block. The two P readiness rounds fill disjoint L0C stripes in a single
+64 KiB slot. After the last MMAD, four calls to Fixpipe write one 32×128
+stripe each. Each call uses `ndNum=4`, a source matrix stride of four
+1024-byte NZ fractals, a destination row stride of 128 FP32 elements,
+and a destination matrix start stride of 32 FP32 elements. The destination
+is the same row-major PV relay used by Vector. The Cube only releases
+the L0C slot and signals `PV_READY` after queuing all four writes on FIX.
+
+Compare `--pv-row32` and `--pv-row32-batch-fix` with the same BN512 input
+and build. Run without either option to include the original BN512 baseline.
+Use the profiler separately to confirm the device emits four PV stores per
+stack (plus the four QK stores).

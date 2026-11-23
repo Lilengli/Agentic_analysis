@@ -102,6 +102,7 @@ struct Stats {
     uint64_t gm_read_elements = 0;
     uint64_t reads_before_first_qk = 0;
     uint64_t gm_write_elements = 0;
+    uint64_t fixpipe_calls = 0;
     uint64_t mmad_calls = 0;
     uint64_t block_reduce_max_calls = 0;
     uint64_t block_reduce_sum_calls = 0;
@@ -543,7 +544,8 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
         ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0,
-        uint32_t c_stride = 0, bool init_c = true, bool store_c = true, bool read_inputs = true) {
+        uint32_t c_stride = 0, bool init_c = true, bool store_c = true, bool read_inputs = true,
+        bool packed_nz = false) {
     if constexpr (DoubleBufferedL0C) {
         const size_t slot_bytes = l0c.owner->size() / 2;
         if (l0c.offset != size_t(l0c_slot) * slot_bytes || size_t(m) * n * sizeof(float) > slot_bytes)
@@ -570,13 +572,16 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
             float sum = 0.0f;
             for (uint32_t x = 0; x < k; ++x)
                 sum += float(a.data[a_layout.Offset(i, x)]) * float(b.data[b_layout.Offset(x, j)]);
-            const size_t local_index = size_t(i) * n + j;
+            const size_t local_index = packed_nz
+                ? size_t(j / 16) * m * 16 + i * 16 + j % 16
+                : size_t(i) * n + j;
             if (!init_c) sum += l0c.GetValue(local_index);
             l0c.SetValue(local_index, sum);
         }
     }
     CubeFASim::CountMmad();
     if (store_c) {
+        CubeFASim::CountVector(&CubeFASim::Stats::fixpipe_calls);
         for (uint32_t i = 0; i < m; ++i) {
             CubeFASim::CountWrite(c.data + size_t(i) * stride, n, sizeof(float));
             for (uint32_t j = 0; j < n; ++j)
@@ -588,7 +593,7 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
     }
 }
 
-template<bool LoadV>
+template<bool LoadV,bool BatchFix=false>
 __aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
     AscendC::GlobalTensor<half> p, AscendC::GlobalTensor<half> v,
     AscendC::GlobalTensor<float> dst, AscendC::LocalTensor<half> l1p,
@@ -602,13 +607,44 @@ __aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
     CubeFASim::CountRead(2*M*K + (LoadV ? K*D : 0));
     for(uint32_t col=0;col<D;col+=N) {
         for(uint32_t sub=0;sub<2;++sub) {
-            if(col==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            if constexpr(!BatchFix) {
+                if(col==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            }
             Gemm(pipe,p[sub*2*M*K],v[col],dst[sub*2*M*D+col],l1p,l1v,l0a,l0b,
                 l0c[sub*l0c_slot_elements+(col/N)*M*N], M,N,K,
                 Catlass::layout::RowMajor(M,K),Catlass::layout::RowMajor(K,N,D),
-                true,0,D,true,true,false);
-            if(col+N==D) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
+                true,0,D,true,!BatchFix,false,BatchFix);
+            if constexpr(!BatchFix) {
+                if(col+N==D) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
+            }
         }
     }
+}
+// Interpret the same NZ2ND parameters as the device writeback.
+inline void StorePvRow32Batched(AscendC::GlobalTensor<float> dst,
+    AscendC::LocalTensor<float> src,int32_t l0c_slot)
+{
+    using L=PvBatchFixLayout;
+    constexpr size_t src_tile_step=L::SrcMatrixStride*L::NzFractalBytes/sizeof(float);
+    for(size_t stripe=0;stripe<D/PvRowTile;++stripe) {
+        CubeFASim::CountVector(&CubeFASim::Stats::fixpipe_calls);
+        const size_t base=stripe*L::StripeElements;
+        for(size_t tile=0;tile<L::Tiles;++tile) {
+            const size_t src_base=base+tile*src_tile_step;
+            const size_t dst_base=base+tile*L::DstMatrixStride;
+            for(size_t i=0;i<PvRowTile;++i) {
+                const size_t dst_row=dst_base+i*L::DstStride;
+                if(dst_row+PvFeatureTile>dst.length)
+                    throw std::runtime_error("mixed simulator: batched Fixpipe output out of bounds");
+                CubeFASim::CountWrite(dst.data+dst_row,PvFeatureTile,sizeof(float));
+                for(size_t j=0;j<PvFeatureTile;++j) {
+                    const size_t src_index=src_base+(j/L::NzColumns)*L::SrcStride*L::NzColumns
+                        +i*L::NzColumns+j%L::NzColumns;
+                    dst.data[dst_row+j]=src.GetValue(src_index);
+                }
+            }
+        }
+    }
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
 }
 } // namespace CubeFA

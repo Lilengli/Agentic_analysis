@@ -4,6 +4,21 @@
 namespace CubeFA {
 constexpr uint32_t D=128;
 constexpr uint32_t PvRowTile=32, PvFeatureTile=32, PvFullKv=512, PvBSlots=2;
+
+// Four compact 32x32 NZ matrices per query stripe. In GM these are
+// scattered to successive 32-column bands of a row-major 32x128 stripe.
+struct PvBatchFixLayout {
+    static constexpr uint32_t Tiles=D/PvFeatureTile;
+    static constexpr uint32_t TileElements=PvRowTile*PvFeatureTile;
+    static constexpr uint32_t StripeElements=PvRowTile*D;
+    static constexpr uint32_t NzColumns=16;
+    static constexpr uint32_t NzFractalBytes=NzColumns*NzColumns*sizeof(float);
+    static constexpr uint32_t SrcStride=PvRowTile; // in C0-sized rows
+    static constexpr uint32_t SrcMatrixStride=TileElements*sizeof(float)/NzFractalBytes;
+    static constexpr uint32_t DstStride=D; // in elements
+    static constexpr uint32_t DstMatrixStride=PvFeatureTile; // in elements
+};
+static_assert(PvBatchFixLayout::Tiles==4 && sizeof(float)==4);
 // Bound the QK work that can sit ahead of a ready PV on the same pipelines.
 constexpr uint32_t ScoreSlots=4;
 constexpr uint32_t QkLookaheadTiles=ScoreSlots-1;

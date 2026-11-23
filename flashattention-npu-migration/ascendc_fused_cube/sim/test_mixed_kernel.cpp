@@ -19,12 +19,12 @@ constexpr uint64_t MmadPerStack = BN / CubeFA::Geometry<BM, BN>::CubeKv +
 constexpr uint8_t kRelayGuard = 0x6d;
 constexpr size_t kGuardBytes = 64;
 
-template<int Core, unsigned BM, unsigned BN, bool PvRow32=false>
+template<int Core, unsigned BM, unsigned BN, bool PvRow32=false, bool BatchFix=false>
 void RunCore(uint32_t group, uint32_t sub, CubeFASim::Stats& stats,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR relay, GM_ADDR masks,
         uint32_t heads, uint32_t seq, uint32_t groups) {
     CubeFASim::SetContext(group, Core == AscendC::AIC ? CubeFASim::Core::AIC : CubeFASim::Core::AIV, sub, &stats);
-    CubeFA::RunCore<Core, BM, BN, PvRow32>(q, k, v, out, relay, masks, heads, seq, groups);
+    CubeFA::RunCore<Core, BM, BN, PvRow32, BatchFix>(q, k, v, out, relay, masks, heads, seq, groups);
 }
 
 void Require(bool condition, const std::string& message) {
@@ -49,7 +49,7 @@ uint64_t ExpectedIterations(uint32_t group, uint32_t groups, uint32_t heads, uin
     return count;
 }
 
-template<unsigned BM, unsigned BN, bool PvRow32=false>
+template<unsigned BM, unsigned BN, bool PvRow32=false, bool BatchFix=false>
 void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const CubeFASim::Stats& aic, const CubeFASim::Stats& av0,
         const CubeFASim::Stats& av1) {
@@ -88,6 +88,10 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         "AIC TILE_DONE waits do not match relay slot reuse and final drain");
     Require(aic.mmad_calls == iterations * MmadPerStack<BM, BN, PvRow32>,
         "AIC group " + std::to_string(group) + " did not issue all QK and PV slices");
+    constexpr uint64_t pv_fixpipe_calls = !PvRow32 ? 1
+        : (BM/CubeFA::PvRowTile) * (BatchFix ? 1 : CubeFA::D/CubeFA::PvFeatureTile);
+    Require(aic.fixpipe_calls == iterations * (BN/G::CubeKv + pv_fixpipe_calls),
+        "AIC did not issue the expected QK and PV Fixpipe calls");
     if constexpr (PvRow32) {
         const uint64_t qk_reads = (BN / G::CubeKv) * (BM * CubeFA::D + G::CubeKv * CubeFA::D);
         const uint64_t pv_reads = BM * BN + BN * CubeFA::D;
@@ -162,7 +166,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     }
 }
 
-template<unsigned BM, unsigned BN, bool PvRow32=false>
+template<unsigned BM, unsigned BN, bool PvRow32=false, bool BatchFix=false>
 void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     std::mt19937 gen(0xC0BFAu + seq * 17 + heads * 31 + BM * 7 + BN + repeat * 131);
     std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -195,7 +199,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     for (uint32_t group = 0; group < groups; ++group) {
         workers.emplace_back([&, group] {
             try {
-                RunCore<AscendC::AIC, BM, BN, PvRow32>(group, 0, aic_stats[group],
+                RunCore<AscendC::AIC, BM, BN, PvRow32, BatchFix>(group, 0, aic_stats[group],
                     reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                     reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                     relay_base, mask_base, heads, seq, groups);
@@ -205,7 +209,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
             workers.emplace_back([&, group, sub] {
                 try {
                     CubeFASim::Stats& stats = sub == 0 ? aiv0_stats[group] : aiv1_stats[group];
-                    RunCore<AscendC::AIV, BM, BN, PvRow32>(group, sub, stats,
+                    RunCore<AscendC::AIV, BM, BN, PvRow32, BatchFix>(group, sub, stats,
                         reinterpret_cast<GM_ADDR>(q.data()), reinterpret_cast<GM_ADDR>(k.data()),
                         reinterpret_cast<GM_ADDR>(v.data()), reinterpret_cast<GM_ADDR>(out.data()),
                         relay_base, mask_base, heads, seq, groups);
@@ -227,7 +231,7 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
     uint64_t total_mmad_calls = 0;
     uint64_t total_output_writes = 0;
     for (uint32_t group = 0; group < groups; ++group) {
-        CheckStats<BM, BN, PvRow32>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
+        CheckStats<BM, BN, PvRow32, BatchFix>(group, groups, heads, seq, aic_stats[group], aiv0_stats[group], aiv1_stats[group]);
         const uint64_t iterations = ExpectedIterations<BM, BN>(group, groups, heads, seq);
         total_iterations += iterations;
         total_mmad_calls += aic_stats[group].mmad_calls;
@@ -274,8 +278,8 @@ void Check(unsigned seq, unsigned heads, unsigned groups, unsigned repeat) {
         }
     }
 
-    std::printf("PASS BM=%u BN=%u PvRow32=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
-        BM, BN, PvRow32, seq, heads, groups, repeat, (unsigned long long)total_iterations,
+    std::printf("PASS BM=%u BN=%u PvRow32=%d BatchFix=%d S=%u H=%u groups=%u repeat=%u KV_tiles=%llu Mmad=%llu max_abs=%.8g UB=%u\n",
+        BM, BN, PvRow32, BatchFix, seq, heads, groups, repeat, (unsigned long long)total_iterations,
         (unsigned long long)total_mmad_calls, max_error, G::UbBytes);
 }
 
@@ -312,6 +316,8 @@ int main(int argc, char** argv) {
         Check<128, 512>(2560, 1, 3, 0);
         Check<128, 512, true>(512, 2, 3, 0);
         Check<128, 512, true>(2560, 1, 3, 0);
+        Check<128, 512, true, true>(512, 2, 3, 0);
+        Check<128, 512, true, true>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

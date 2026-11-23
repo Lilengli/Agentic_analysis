@@ -73,7 +73,7 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
 
 // One 32-row tranche from each AIV. P stays in L0A for all four
 // feature tiles. Each B tile serves both AIV row blocks before its slot is reused.
-template<bool LoadV>
+template<bool LoadV,bool BatchFix=false>
 __aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
     AscendC::GlobalTensor<half> p, AscendC::GlobalTensor<half> v,
     AscendC::GlobalTensor<float> dst, AscendC::LocalTensor<half> l1p,
@@ -132,14 +132,18 @@ __aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(ready[slot]);
         for(uint32_t sub=0;sub<2;++sub) {
             auto c=l0c[sub*l0c_slot_elements+feature*M*N];
-            if(feature==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            if constexpr(!BatchFix) {
+                if(feature==0) AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(sub);
+            }
             Catlass::Gemm::Tile::TileMmad<Arch,HalfRM,HalfRM,void>{}(
                 c,l0a[sub*PElements],b,M,N,K);
-            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(sub);
-            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(sub);
-            typename Copies::CopyL0CToGm{}(dst[sub*aiv_row_stride*D+col],c,
-                Catlass::layout::RowMajor(M,N,D),cl0);
-            if(feature+1==Features) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
+            if constexpr(!BatchFix) {
+                AscendC::SetFlag<AscendC::HardEvent::M_FIX>(sub);
+                AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(sub);
+                typename Copies::CopyL0CToGm{}(dst[sub*aiv_row_stride*D+col],c,
+                    Catlass::layout::RowMajor(M,N,D),cl0);
+                if(feature+1==Features) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(sub);
+            }
         }
         if(feature+PvBSlots<Features)
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(released[slot]);
@@ -148,6 +152,28 @@ __aicore__ inline void PvFeatureStripe(AscendC::TPipe& pipe,
         pipe.ReleaseEventID<AscendC::HardEvent::MTE1_M>(ready[slot]);
         pipe.ReleaseEventID<AscendC::HardEvent::M_MTE1>(released[slot]);
     }
+}
+
+// M must finish all 16 output tiles before FIX reads the packed L0C slot.
+__aicore__ inline void StorePvRow32Batched(AscendC::GlobalTensor<float> dst,
+    AscendC::LocalTensor<float> src,int32_t l0c_slot)
+{
+    using Layout=PvBatchFixLayout;
+    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0c_slot);
+    AscendC::FixpipeParamsV220 params{};
+    params.mSize=PvRowTile;
+    params.nSize=PvFeatureTile;
+    params.srcStride=Layout::SrcStride;
+    params.dstStride=Layout::DstStride;
+    params.ndNum=Layout::Tiles;
+    params.srcNdStride=Layout::SrcMatrixStride;
+    params.dstNdStride=Layout::DstMatrixStride;
+    for(uint32_t row=0;row<D;row+=PvRowTile) {
+        const uint32_t offset=row*D;
+        AscendC::Fixpipe<float,float,AscendC::CFG_ROW_MAJOR>(dst[offset],src[offset],params);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
 }
 
 // Isolate physical Cube/layout behavior from cross-core scheduling in tests.
