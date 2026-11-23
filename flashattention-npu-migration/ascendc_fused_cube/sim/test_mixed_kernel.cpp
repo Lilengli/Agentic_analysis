@@ -63,16 +63,20 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const uint32_t kv_tiles = uint32_t(task % query_tiles) * BM / BN + 1;
         for (uint32_t remaining = kv_tiles; remaining > 0; --remaining) {
             ++expected_pending[std::min(remaining, CubeFA::ScoreSlots)];
-            ++expected_pending_before_done[std::min(remaining - 1, CubeFA::ScoreSlots)];
         }
+        for (uint32_t tile = CubeFA::PvRelaySlots; tile < kv_tiles; ++tile)
+            ++expected_pending_before_done[
+                std::min(kv_tiles - tile, CubeFA::ScoreSlots)];
+        expected_pending_before_done[0] += std::min(kv_tiles, CubeFA::PvRelaySlots);
         for (uint32_t tile = 0; tile < kv_tiles; ++tile)
-            expected_prepared_at_pv_wait.push_back(prepared + std::min(tile + 2, kv_tiles));
+            expected_prepared_at_pv_wait.push_back(
+                prepared + std::min(tile + CubeFA::PvRelaySlots, kv_tiles));
         prepared += kv_tiles;
     }
     Require(aic.pending_qk_at_p_waits == expected_pending,
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
-        "AIC did not refill the score ring before waiting for TILE_DONE");
+        "AIC TILE_DONE waits do not match parity reuse and final drain");
     Require(aic.mmad_calls == 2 * iterations,
         "AIC group " + std::to_string(group) + " did not issue exactly two Mmad products per KV tile");
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
@@ -96,22 +100,19 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             "AIV UB buffers exceed or differ from Geometry::UbBytes");
         Require(av->pv_waits.size() == expected_prepared_at_pv_wait.size(),
             "AIV PV wait count does not match the number of KV tiles");
-        Require(av->row_sum_calls_at_p_ready.size() == iterations,
-            "AIV P_READY count does not match the number of KV tiles");
-        constexpr uint64_t sum_calls_per_tile = 2 * (BN / 64);
         for (size_t i = 0; i < av->pv_waits.size(); ++i) {
             const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
             const auto& snapshot = av->pv_waits[i];
+            Require(snapshot.p_ready_calls == scores_prepared,
+                "AIV must publish the next probability tile before waiting for the current PV");
             Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,
                 "AIV did not reduce the next score before waiting for PV");
-            Require(snapshot.exp_calls == 2 * scores_prepared,
-                "AIV must exponentiate the next score tile before waiting for PV");
-            Require(av->row_sum_calls_at_p_ready[i] == i * sum_calls_per_tile &&
-                    snapshot.block_reduce_sum_calls == (i + 1) * sum_calls_per_tile,
-                "AIV must reduce the current denominator between P_READY and the PV wait");
-            Require(snapshot.mul_calls == (i + 1) * mul_calls_per_tile,
+            Require(snapshot.exp_calls == 2 * scores_prepared &&
+                    snapshot.block_reduce_sum_calls == scores_prepared * (BN / 64) * 2,
+                "AIV must finish the next softmax before waiting for PV");
+            Require(snapshot.mul_calls == scores_prepared + (i + 1) * (CubeFA::D / 64),
                 "AIV must rescale the denominator and output before waiting for PV");
         }
         Require(av->gm_read_elements == mask_reads + iterations * (uint64_t(R) * BN + uint64_t(R) * CubeFA::D),

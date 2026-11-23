@@ -32,40 +32,44 @@ implementation when a check fails.
    AIV updates the running row maxima and alpha exponents with vector
    Max/Sub, then broadcasts the updated row maxima with Brcb and subtracts them
    across all rows with one Sub call per 64-column segment.
-   Exponentiated weights are cast to FP16 and sent to the relay. The FP32
-   denominator updates use the retained FP32 weights after queuing P_READY.
+   Exponentiated weights are cast to FP16 and sent to
+   the relay; FP32 denominators use the weights before this cast.
 4. AIC waits for both halves and computes `P @ V` using Cube, with FP32 output
    through Fixpipe. Each AIV broadcasts alpha and scales the old output
    with strided vector multiplies while PV is pending. When PV is ready,
-   the AIV DMA-loads its result rows and adds them to the scaled output.
-   A reverse handshake protects relay
-   reuse. Final normalized output is written once per query tile.
+   the AIV DMA-loads its result rows and adds them to the scaled output. A
+   reverse handshake protects reuse of each PV slot. Final normalized output
+   is written once per query tile.
 
 This design intentionally uses **bounded GM relay transfers**. It does not
 claim all scores/probabilities stay on chip. There is no full S-by-S tensor.
-Default BM64/BN128 uses 176 KiB of relay per group, or **4.125 MiB for 24 groups**,
-independent of sequence length. BM32/BN64 uses 52 KiB per group and BM128/BN128
-uses 352 KiB. The extra score slots increase workspace capacity without
-adding a score transfer. For BM64/BN128, configured L1/L0A/L0B/L0C storage is
-64/16/32/64 KiB, respectively. Source UB allocation per AIV is 84,864 bytes.
+Default BM64/BN128 uses 224 KiB of relay per group, or **5.25 MiB for 24 groups**,
+independent of sequence length. BM32/BN64 uses 72 KiB per group and BM128/BN128
+uses 448 KiB, or **10.5 MiB for 24 groups**. The extra slots increase workspace
+capacity without adding a transfer per tile. For BM64/BN128, configured
+L1/L0A/L0B/L0C storage is 64/16/32/64 KiB, respectively. Source UB allocation
+per AIV is 84,864 bytes.
 The UB budget also leaves 8 KiB for Select's internal workspace.
 
-Each score slot has its own FIX ready flag. P_READY (MTE3), PV_READY (FIX), and
-TILE_DONE (V) are shared across iterations. P_READY releases the old score
-slot. After issuing PV, the AIC can refill that slot before both AIVs send
-TILE_DONE. TILE_DONE still gates reuse of the shared probability and PV relays.
-The AIC alternates two
-L0C slots across QK and PV products. Each slot's M_FIX event gates its copy to
-GM, and its FIX_M event gates reuse after that copy. On a device trace, compare
-the overlap of the second QK MMAD with the first QK FIX copy and the gap between
-those two FIX copies. Measure end-to-end performance on board.
+Each score slot has its own FIX ready flag. Each of the two P/PV relay pairs
+has its own P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) flags. P_READY
+also releases the score slot. The AIC can issue the first two PV products
+without a TILE_DONE wait, then waits for both AIVs to consume PV from two tiles
+earlier before writing to that same slot. At the end of a query tile it drains
+only the outstanding releases before resetting the relay indices.
+
+The AIC alternates two L0C slots across QK and PV products independently of
+the GM slots. Each slot's M_FIX event gates its copy to GM, and its FIX_M
+event gates reuse after that copy.
 
 Each AIV alternates two score buffers and two P views in UB. After queuing a
-tile's P store and ready flag, it updates the denominator, scales the old
-output, and prepares the next tile's weights while PV is pending. The
-final-output staging buffer holds the alternate P tile. The next P store
-reuses the GM relay after the current PV has been consumed and TILE_DONE has
-been issued.
+tile's P store, it scales the old output with that tile's alpha, then computes
+the next tile's softmax and writes its P to the alternate GM slot before
+waiting for the current PV. The AIV has already consumed the previous PV before
+it reuses either P slot, so Cube has finished reading the old P. Output
+accumulation stays in KV order. On a device trace, compare when tile B's
+P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
+steady interval between PV_READY events and the whole call time.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
 S divisible by BN and up to 16384; BM32/64/128 with BM<=BN, BN64/128, 1..24 AIC groups. No GQA,
@@ -125,9 +129,9 @@ compilation, products, repeated mixed runs and MAC counters remain necessary.
 The semantic suite covers all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. It also checks S512 with
 BM128/BN128 and S640 with BM32/BN64, including a full score ring and wraparound.
-It checks that the AIC refills the ring before waiting for TILE_DONE. The maximum absolute error
-against independent FP64 causal reference was 0.00108919, within the established
-atol=.002, rtol=.01 check. Tests checked two matrix products per KV iteration,
+It checks the score ring depth, PV relay reuse waits, and compares results
+against an independent FP64 causal reference with atol=.002 and rtol=.01.
+Other checks cover two matrix products per KV iteration,
 both-AIV flag participation, repeated relay reuse, bounds/alignment, and UB
 allocation accounting. They do not validate full 16K or real-device behavior.
 

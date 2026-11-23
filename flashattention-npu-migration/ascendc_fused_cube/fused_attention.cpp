@@ -96,8 +96,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_relay_bytes_per_group_bm64_bn64"]=CubeFA::Geometry<64,64>::RelayBytes;
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
-        d["gm_intermediates"]="FP32 score ring, one FP16 probability slot, one FP32 PV slot per group";
+        d["gm_intermediates"]="FP32 score ring, two FP16 probability slots and two FP32 PV slots per group";
         d["gm_score_slots"]=CubeFA::ScoreSlots;
+        d["gm_pv_slots"]=CubeFA::PvRelaySlots;
         d["qk_lookahead_tiles"]=CubeFA::QkLookaheadTiles;
         d["aiv_score_ub_slots"]=CubeFA::UbScoreSlots;
         d["causal_mask"]="cached packed GM bitmap prefetched to UB for vector Select";
@@ -105,7 +106,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["online_max_update"]="vector Max/Sub with alternating UB views";
         d["score_row_max"]="two-stage BlockReduceMax";
         d["score_row_sum"]="two-stage BlockReduceSum";
-        d["denominator_update"]="after P_READY";
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";

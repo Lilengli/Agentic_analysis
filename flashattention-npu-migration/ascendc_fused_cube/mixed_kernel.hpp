@@ -13,6 +13,20 @@ __aicore__ inline uint16_t ScoreReadyFlag(uint32_t slot)
     return slot==0 ? QK_READY : QK_EXTRA_READY_BASE+slot-1;
 }
 
+__aicore__ inline uint16_t RelayFlag(uint16_t flag,uint32_t slot)
+{
+    return flag+slot*RelayFlagStride;
+}
+
+template<uint32_t R,uint32_t BN>
+__aicore__ inline void PublishP(AscendC::GlobalTensor<half> pgm,AscendC::LocalTensor<half> p,
+    uint32_t slot,uint32_t sub,AscendC::TPipe& pipe)
+{
+    Sync<AscendC::HardEvent::V_MTE3>(pipe);
+    AscendC::DataCopy(pgm[(slot*2+sub)*R*BN],p,R*BN);
+    AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(RelayFlag(P_READY,slot));
+}
+
 template<uint32_t Rows,uint32_t BN>
 __aicore__ inline void ReduceRowMax64(AscendC::LocalTensor<float> row_max,
     AscendC::LocalTensor<float> scores, AscendC::LocalTensor<float> partial)
@@ -65,9 +79,10 @@ __aicore__ inline void PrepareScoreTile(AscendC::LocalTensor<float> s,
 }
 
 template<uint32_t R,uint32_t BN>
-__aicore__ inline void PrepareProbabilities(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
-    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> alpha,
-    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> row_blocks)
+__aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::LocalTensor<half> p,
+    AscendC::LocalTensor<float>& m, AscendC::LocalTensor<float> l, AscendC::LocalTensor<float> alpha,
+    AscendC::LocalTensor<float>& maxA, AscendC::LocalTensor<float> sumA,
+    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
 {
     constexpr uint32_t Fp32Block=32/sizeof(float), Fp32Repeat=256/sizeof(float);
     AscendC::PipeBarrier<PIPE_V>();
@@ -89,14 +104,7 @@ __aicore__ inline void PrepareProbabilities(AscendC::LocalTensor<float> s, Ascen
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
-}
-
-template<uint32_t R,uint32_t BN>
-__aicore__ inline void UpdateDenominator(AscendC::LocalTensor<float> s, AscendC::LocalTensor<float> l,
-    AscendC::LocalTensor<float> alpha, AscendC::LocalTensor<float> sumA,
-    AscendC::LocalTensor<float> sumB, AscendC::LocalTensor<float> row_blocks)
-{
+    // The preceding barrier releases the scratch used to broadcast row maxima.
     ReduceRowSum64<R,BN>(sumA,s,row_blocks);
     if constexpr(BN==128) {
         AscendC::PipeBarrier<PIPE_V>();
@@ -104,6 +112,7 @@ __aicore__ inline void UpdateDenominator(AscendC::LocalTensor<float> s, AscendC:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(sumA,sumA,sumB,R);
     }
+    AscendC::Cast(p,s,AscendC::RoundMode::CAST_RINT,R*BN);
     AscendC::Mul(l,l,alpha,R);
     AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(l,l,sumA,R);
 }
@@ -125,8 +134,9 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     ogm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output),uint64_t(heads)*seq*D);
     // The first score slot precedes P/PV; the remaining score slots follow them.
     sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),G::RelayBytes/sizeof(float));
-    pgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(relay+offset+G::SBytes),BM*BN);
-    dgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset+G::SBytes+G::PBytes),BM*D);
+    pgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(relay+offset+G::SBytes),PvRelaySlots*BM*BN);
+    dgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset+G::SBytes+PvRelaySlots*G::PBytes),
+        PvRelaySlots*BM*D);
     constexpr uint32_t second_score=G::SecondScoreOffset/sizeof(float);
     AscendC::TPipe pipe;
     if constexpr(Core==AscendC::AIC) {
@@ -155,7 +165,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint64_t base=uint64_t(head)*seq*D;
             constexpr int32_t step=BN;
             const int32_t first_key=(qs/BN)*BN;
-            uint32_t slot=0;
+            uint32_t slot=0, issued_pv=0;
             for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
                 if (qk_key>=0) {
@@ -169,17 +179,19 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 }
                 // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
-                // Previous P_READY freed its score slot. Allow a new QK above
-                // this wait while the AIV still consumes the previous PV relay.
-                if (pv_key<first_key) AscendC::CrossCoreWaitFlag(TILE_DONE);
-                AscendC::CrossCoreWaitFlag(P_READY);
-                Gemm<true>(pipe,pgm,vgm[base+uint64_t(pv_key)*D],dgm,pl,bl,a0,b0,
-                    c0[accum_slot*L0CSlotElements],BM,D,BN,Catlass::layout::RowMajor(BM,BN),
+                const uint32_t pv_slot=issued_pv%PvRelaySlots;
+                if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
+                AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
+                Gemm<true>(pipe,pgm[pv_slot*BM*BN],vgm[base+uint64_t(pv_key)*D],dgm[pv_slot*BM*D],
+                    pl,bl,a0,b0,c0[accum_slot*L0CSlotElements],BM,D,BN,Catlass::layout::RowMajor(BM,BN),
                     Catlass::layout::RowMajor(BN,D),true,accum_slot);
                 accum_slot^=1;
-                AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(PV_READY);
+                AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
+                ++issued_pv;
             }
-            AscendC::CrossCoreWaitFlag(TILE_DONE);
+            const uint32_t first_pending=issued_pv>PvRelaySlots ? issued_pv-PvRelaySlots : 0;
+            for(uint32_t tile=first_pending;tile<issued_pv;++tile)
+                AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,tile%PvRelaySlots));
         }
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
@@ -229,16 +241,9 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
             PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,gm_slot,
                 masks[mask_offset]);
-            PrepareProbabilities<R,BN>(score_ub,p,m,alpha,maxA,row_blocks);
+            CompleteSoftmax<R,BN>(score_ub,p,m,l,alpha,maxA,sumA,sumB,row_blocks);
+            PublishP<R,BN>(pgm,p,0,sub,pipe);
             for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
-                // Reuse the final-output staging buffer as the second P slot.
-                auto current_p=ub_slot==0 ? p : oh;
-                Sync<AscendC::HardEvent::V_MTE3>(pipe);
-                AscendC::DataCopy(pgm[sub*R*BN],current_p,R*BN);
-                AscendC::CrossCoreSetFlag<0x2,PIPE_MTE3>(P_READY);
-                // P's DMA reads the FP16 buffer while the denominator uses the FP32 weights.
-                auto current_s=score_ub[ub_slot*ScoreElements];
-                UpdateDenominator<R,BN>(current_s,l,alpha,sumA,sumB,row_blocks);
                 // Prior Vector work has finished with the alternate score slot and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
                 // Rescaling the old output only needs alpha, so queue it before the PV wait.
@@ -252,20 +257,20 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     gm_slot=gm_slot+1==ScoreSlots ? 0 : gm_slot+1;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
                     // QK for the next tile is issued before AIC waits for this P_READY.
-                    auto next_s=score_ub[(ub_slot^1)*ScoreElements];
-                    auto next_p=ub_slot==0 ? oh : p;
+                    const uint32_t next_slot=ub_slot^1;
+                    auto next_s=score_ub[next_slot*ScoreElements];
+                    auto next_p=next_slot==0 ? p : oh;
                     PrepareScoreTile<R,BN,false>(next_s,sgm[next_score_offset+score_row_offset],
                         maxA,maxB,row_blocks,gm_slot,masks);
-                    // The current alpha has already been used to rescale out.
-                    // Keep next_p in UB until the current PV releases the shared GM relay.
-                    PrepareProbabilities<R,BN>(next_s,next_p,m,alpha,maxA,row_blocks);
+                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha,maxA,sumA,sumB,row_blocks);
+                    PublishP<R,BN>(pgm,next_p,next_slot,sub,pipe);
                 }
-                AscendC::CrossCoreWaitFlag(PV_READY);
-                AscendC::DataCopy(delta,dgm[sub*R*D],R*D);
+                AscendC::CrossCoreWaitFlag(RelayFlag(PV_READY,ub_slot));
+                AscendC::DataCopy(delta,dgm[ub_slot*BM*D+sub*R*D],R*D);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(out,out,delta,R*D);
-                AscendC::CrossCoreSetFlag<0x2,PIPE_V>(TILE_DONE);
+                AscendC::CrossCoreSetFlag<0x2,PIPE_V>(RelayFlag(TILE_DONE,ub_slot));
                 AscendC::PipeBarrier<PIPE_V>();
             }
             Sync<AscendC::HardEvent::V_S>(pipe);

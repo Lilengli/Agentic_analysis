@@ -6,11 +6,14 @@ constexpr uint32_t D=128;
 // Bound the QK work that can sit ahead of a ready PV on the same pipelines.
 constexpr uint32_t ScoreSlots=4;
 constexpr uint32_t QkLookaheadTiles=ScoreSlots-1;
+constexpr uint32_t PvRelaySlots=2;
 constexpr uint32_t UbScoreSlots=2;
+static_assert(PvRelaySlots==2 && QkLookaheadTiles>=1);
 constexpr uint32_t SelectScratchBytes=8*1024;
 constexpr uint32_t RelayBytesFor(uint32_t bm, uint32_t bn)
 {
-    return ScoreSlots * bm * bn * sizeof(float) + bm * bn * sizeof(uint16_t) + bm * D * sizeof(float);
+    return ScoreSlots * bm * bn * sizeof(float) +
+        PvRelaySlots * (bm * bn * sizeof(uint16_t) + bm * D * sizeof(float));
 }
 constexpr uint32_t MaskWordsPerAiv(uint32_t bn)
 {
@@ -42,7 +45,7 @@ template<uint32_t BM,uint32_t BN> struct Geometry {
     static constexpr uint32_t SBytes=BM*BN*4;
     static constexpr uint32_t PBytes=BM*BN*2;
     static constexpr uint32_t DeltaBytes=BM*D*4;
-    static constexpr uint32_t SecondScoreOffset=SBytes+PBytes+DeltaBytes;
+    static constexpr uint32_t SecondScoreOffset=SBytes+PvRelaySlots*(PBytes+DeltaBytes);
     static constexpr uint32_t RelayBytes=RelayBytesFor(BM,BN);
     static constexpr uint32_t CausalMaskWords=Rows*BN/32;
     static constexpr uint32_t CausalMaskBytes=MaskWordsPerAiv(BN)*sizeof(uint32_t);
@@ -52,5 +55,7 @@ template<uint32_t BM,uint32_t BN> struct Geometry {
 };
 constexpr uint16_t QK_READY=0, P_READY=1, PV_READY=2, TILE_DONE=3, QK_EXTRA_READY_BASE=4;
 constexpr uint16_t LAST_QK_READY=QK_EXTRA_READY_BASE+ScoreSlots-2;
-static_assert(LAST_QK_READY<=15);
+constexpr uint16_t RelayFlagStride=LAST_QK_READY+1-P_READY;
+constexpr uint16_t LAST_RELAY_FLAG=TILE_DONE+RelayFlagStride;
+static_assert(QK_READY<P_READY && TILE_DONE<QK_EXTRA_READY_BASE && LAST_RELAY_FLAG<=15);
 } // namespace CubeFA

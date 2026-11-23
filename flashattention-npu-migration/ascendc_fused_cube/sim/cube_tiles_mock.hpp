@@ -76,9 +76,19 @@ constexpr int PIPE_MTE3 = 2;
 constexpr int PIPE_FIX = 3;
 
 namespace CubeFASim {
-constexpr unsigned kFlagCount = CubeFA::LAST_QK_READY + 1;
+constexpr unsigned kFlagCount = CubeFA::LAST_RELAY_FLAG + 1;
 constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
+
+inline constexpr uint32_t PReadyFlag(uint32_t slot) {
+    return CubeFA::P_READY + slot * CubeFA::RelayFlagStride;
+}
+inline constexpr uint32_t PvReadyFlag(uint32_t slot) {
+    return CubeFA::PV_READY + slot * CubeFA::RelayFlagStride;
+}
+inline constexpr uint32_t TileDoneFlag(uint32_t slot) {
+    return CubeFA::TILE_DONE + slot * CubeFA::RelayFlagStride;
+}
 
 struct Stats {
     struct PvWaitSnapshot {
@@ -87,6 +97,7 @@ struct Stats {
         uint64_t mul_calls;
         uint64_t exp_calls;
         uint64_t block_reduce_sum_calls;
+        uint64_t p_ready_calls;
     };
 
     uint64_t gm_read_elements = 0;
@@ -102,12 +113,12 @@ struct Stats {
     uint64_t mul_calls = 0;
     uint64_t muls_calls = 0;
     uint64_t exp_calls = 0;
+    uint64_t p_ready_calls = 0;
     uint64_t cast_calls = 0;
     uint64_t duplicate_calls = 0;
     uint64_t select_calls = 0;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_p_waits{};
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_done_waits{};
-    std::vector<uint64_t> row_sum_calls_at_p_ready;
     std::vector<PvWaitSnapshot> pv_waits;
     std::array<size_t, 5> local_bytes_by_position{};
 };
@@ -176,8 +187,9 @@ inline void AbortGroup(uint32_t group) noexcept {
 
 inline void SetFlag(uint32_t flag) {
     if (flag >= kFlagCount) throw std::runtime_error("mixed simulator: invalid flag");
-    if (context.core == Core::AIV && flag == CubeFA::P_READY && context.stats)
-        context.stats->row_sum_calls_at_p_ready.push_back(context.stats->block_reduce_sum_calls);
+    if (context.core == Core::AIV && context.stats &&
+            (flag == PReadyFlag(0) || flag == PReadyFlag(1)))
+        ++context.stats->p_ready_calls;
     FlagState& state = GroupFlags(context.group);
     {
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -194,10 +206,10 @@ inline void WaitFlag(uint32_t flag) {
     if (context.core == Core::AIV) {
         if (flag == CubeFA::QK_READY && context.seen_broadcasts[flag] == 0 && context.stats)
             context.stats->reads_before_first_qk = context.stats->gm_read_elements;
-        if (flag == CubeFA::PV_READY && context.stats) {
+        if ((flag == PvReadyFlag(0) || flag == PvReadyFlag(1)) && context.stats) {
             auto& stats = *context.stats;
             stats.pv_waits.push_back({stats.gm_read_elements, stats.block_reduce_max_calls,
-                stats.mul_calls, stats.exp_calls, stats.block_reduce_sum_calls});
+                stats.mul_calls, stats.exp_calls, stats.block_reduce_sum_calls, stats.p_ready_calls});
         }
         const uint64_t target = context.seen_broadcasts[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
@@ -210,15 +222,19 @@ inline void WaitFlag(uint32_t flag) {
         if (state.aborted) throw std::runtime_error("mixed simulator: group aborted while waiting for AIC broadcast");
         ++context.seen_broadcasts[flag];
     } else {
-        if ((flag == CubeFA::P_READY || flag == CubeFA::TILE_DONE) && context.stats) {
+        const bool p_ready = flag == PReadyFlag(0) || flag == PReadyFlag(1);
+        const bool tile_done = flag == TileDoneFlag(0) || flag == TileDoneFlag(1);
+        if ((p_ready || tile_done) && context.stats) {
             uint64_t sent = state.broadcasts[CubeFA::QK_READY];
             for (unsigned id = CubeFA::QK_EXTRA_READY_BASE; id <= CubeFA::LAST_QK_READY; ++id)
                 sent += state.broadcasts[id];
-            const uint64_t pending = sent - context.waited_arrivals[CubeFA::P_READY];
-            if (pending > CubeFA::ScoreSlots || (flag == CubeFA::P_READY && pending == 0))
+            const uint64_t consumed = context.waited_arrivals[PReadyFlag(0)] +
+                context.waited_arrivals[PReadyFlag(1)];
+            const uint64_t pending = sent - consumed;
+            if (pending > CubeFA::ScoreSlots || (p_ready && pending == 0))
                 throw std::runtime_error("mixed simulator: score queue depth out of bounds");
-            auto& counts = flag == CubeFA::P_READY ? context.stats->pending_qk_at_p_waits
-                                                  : context.stats->pending_qk_at_done_waits;
+            auto& counts = p_ready ? context.stats->pending_qk_at_p_waits
+                                   : context.stats->pending_qk_at_done_waits;
             ++counts[pending];
         }
         const uint64_t target = (context.waited_arrivals[flag] + 1) * kAivCount;
