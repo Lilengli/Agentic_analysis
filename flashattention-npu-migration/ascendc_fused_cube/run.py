@@ -28,6 +28,8 @@ def main():
                     help='early PV with one Fixpipe per 32 output rows')
     pv.add_argument('--prioritize-p-writeback', action='store_true',
                     help='for BM128/BN512, wait for the oldest P before refilling the QK queue')
+    pv.add_argument('--defer-qk-fixpipe', action='store_true',
+                    help='compute two QK slices before P_READY and delay their score stores')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
     p.add_argument('--warmup', type=int, default=1)
@@ -49,6 +51,8 @@ def main():
         p.error('row32 PV modes require --block-m 128 --block-n 512')
     if a.prioritize_p_writeback and (a.block_m, a.block_n) != (128, 512):
         p.error('--prioritize-p-writeback requires --block-m 128 --block-n 512')
+    if a.defer_qk_fixpipe and (a.block_m, a.block_n) != (128, 512):
+        p.error('--defer-qk-fixpipe requires --block-m 128 --block-n 512')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
@@ -65,6 +69,11 @@ def main():
     if a.prioritize_p_writeback:
         implementation['qk_lookahead_tiles'] = 2
         implementation['qk_refill_order'] = 'after oldest P_READY and PV'
+    if a.defer_qk_fixpipe:
+        implementation['qk_lookahead_tiles'] = 2
+        implementation['qk_primed_stacks'] = 2
+        implementation['qk_slices_staged_before_p_ready'] = 2
+        implementation['qk_refill_order'] = 'stage two QK slices, wait P_READY, finish QK stores, submit PV'
     print('implementation:', implementation, flush=True)
     from verify_products import run_checks
     run_checks()
@@ -74,7 +83,7 @@ def main():
 
     def call():
         return fused_cube_ext.forward(q, k, v, a.block_m, a.block_n, a.blocks,
-                                      pv_row32, a.pv_row32_batch_fix, a.prioritize_p_writeback)
+                                      pv_row32, a.pv_row32_batch_fix, a.prioritize_p_writeback, a.defer_qk_fixpipe)
 
     def verify(out, label):
         # Copy only sampled outputs for CPU FP32 comparison. All values in all
@@ -171,6 +180,7 @@ def main():
               'block_m': a.block_m, 'block_n': a.block_n, 'blocks': a.blocks,
               'pv_row32': pv_row32, 'pv_row32_batch_fix': a.pv_row32_batch_fix,
               'prioritize_p_writeback': a.prioritize_p_writeback,
+              'defer_qk_fixpipe': a.defer_qk_fixpipe,
               'gm_relay_bytes': a.blocks * implementation[f'gm_relay_bytes_per_group_bm{a.block_m}_bn{a.block_n}'],
               'implementation': implementation, 'wall_ms': wall_ms, 'event_us': event_us,
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,

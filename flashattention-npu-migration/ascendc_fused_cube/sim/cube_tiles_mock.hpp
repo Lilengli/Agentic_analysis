@@ -121,6 +121,7 @@ struct Stats {
     std::array<uint64_t, CubeFA::ScoreSlots + 1> pending_qk_at_done_waits{};
     std::vector<PvWaitSnapshot> pv_waits;
     std::vector<uint64_t> p_ready_mmad_count;
+    std::vector<uint64_t> p_ready_fixpipe_count;
     std::array<size_t, 5> local_bytes_by_position{};
 };
 
@@ -236,7 +237,10 @@ inline void WaitFlag(uint32_t flag) {
             auto& counts = p_ready ? context.stats->pending_qk_at_p_waits
                                    : context.stats->pending_qk_at_done_waits;
             ++counts[pending];
-            if (p_ready) context.stats->p_ready_mmad_count.push_back(context.stats->mmad_calls);
+            if (p_ready) {
+                context.stats->p_ready_mmad_count.push_back(context.stats->mmad_calls);
+                context.stats->p_ready_fixpipe_count.push_back(context.stats->fixpipe_calls);
+            }
         }
         const uint64_t target = context.waited_arrivals[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
@@ -591,6 +595,23 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
         }
     }
+}
+
+template<uint32_t BM,uint32_t CubeKv,uint32_t BN>
+inline void StoreQkSlice(AscendC::GlobalTensor<float> score,
+    AscendC::LocalTensor<float> src,int32_t slot)
+{
+    const auto bytes=src.owner->size()/2;
+    if(src.offset!=size_t(slot)*bytes || BM*CubeKv*sizeof(float)>bytes ||
+       (BM-1)*BN+CubeKv>score.length)
+        throw std::runtime_error("mixed simulator: deferred QK store exceeds its slot");
+    CubeFASim::CountVector(&CubeFASim::Stats::fixpipe_calls);
+    for(uint32_t i=0;i<BM;++i) {
+        CubeFASim::CountWrite(score.data+i*BN,CubeKv,sizeof(float));
+        for(uint32_t j=0;j<CubeKv;++j)
+            score.data[i*BN+j]=src.GetValue(i*CubeKv+j);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(slot);
 }
 
 template<bool LoadV,bool BatchFix=false>

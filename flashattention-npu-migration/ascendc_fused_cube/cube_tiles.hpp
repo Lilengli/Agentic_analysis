@@ -71,6 +71,21 @@ __aicore__ inline void Gemm(AscendC::TPipe& pipe,
     }
 }
 
+// The deferred QK MMAD has acquired this slot but has not queued a store.
+template<uint32_t BM,uint32_t CubeKv,uint32_t BN>
+__aicore__ inline void StoreQkSlice(AscendC::GlobalTensor<float> score,
+    AscendC::LocalTensor<float> src,int32_t slot)
+{
+    using Arch=Catlass::Arch::AtlasA2;
+    using CT=Catlass::Gemm::GemmType<float,Catlass::layout::RowMajor>;
+    auto layout=Catlass::layout::zN::MakeLayoutInL0C(Catlass::MakeCoord(BM,CubeKv));
+    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(slot);
+    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(slot);
+    Catlass::Gemm::Tile::CopyL0CToGm<Arch,float,CT>{}(
+        score,src,Catlass::layout::RowMajor(BM,CubeKv,BN),layout);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(slot);
+}
+
 // One 32-row tranche from each AIV. P stays in L0A for all four
 // feature tiles. Each B tile serves both AIV row blocks before its slot is reused.
 template<bool LoadV,bool BatchFix=false>

@@ -275,3 +275,17 @@ Compare both modes at the same 16K shape without profiler overhead. In a
 matched 1536 / core9 simulator trace, compare A's final two MTE3 P writes
 and the position of the first QK(C) score store. Faster P stores on their own
 do not guarantee faster attention; reduced QK lookahead can add idle time.
+
+### Defer the next QK score stores (BM128/BN512)
+
+`--defer-qk-fixpipe` keeps the default BN512 path available for A/B comparison.
+Cube primes QK(A) and QK(B) normally. It computes the first two QK(C) slices
+into the two L0C slots and waits for both AIVs to finish writing P(A).
+Only then does it submit the two delayed Fixpipe stores, complete the remaining
+QK(C) slices, and submit PV(A). The same rule applies to later QK refills;
+if there is no later QK stack, Cube proceeds to PV after its normal P wait.
+
+The experiment does not change memory arbitration priority or total bytes moved.
+The Cube must release at least one L0C slot before it can start another MMAD.
+The CPU simulator checks that exactly two additional QK MMADs, but no newer
+score stores, are submitted before the P wait when a refill is available.
