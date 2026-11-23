@@ -43,18 +43,19 @@ implementation when a check fails.
 
 This design intentionally uses **bounded GM relay transfers**. It does not
 claim all scores/probabilities stay on chip. There is no full S-by-S tensor.
-Default BM64/BN128 uses 224 KiB of relay per group, or **5.25 MiB for 24 groups**,
-independent of sequence length. BM32/BN64 uses 72 KiB per group and BM128/BN128
-uses 448 KiB, or **10.5 MiB for 24 groups**. The extra slots increase workspace
+Default BM64/BN128 uses 272 KiB of relay per group, or **6.375 MiB for 24 groups**,
+independent of sequence length. BM32/BN64 uses 92 KiB per group and BM128/BN128
+uses 544 KiB, or **12.75 MiB for 24 groups**. The extra slots increase workspace
 capacity without adding a transfer per tile. For BM64/BN128, configured
 L1/L0A/L0B/L0C storage is 64/16/32/64 KiB, respectively. Source UB allocation
-per AIV is 84,864 bytes.
+per AIV is 93,312 bytes.
 The UB budget also leaves 8 KiB for Select's internal workspace.
 
-Each score slot has its own FIX ready flag. Each of the two P/PV relay pairs
+Ordered QK notifications alternate two FIX ready flags across the four score
+slots. Each of the three P/PV relay pairs
 has its own P_READY (MTE3), PV_READY (FIX), and TILE_DONE (V) flags. P_READY
-also releases the score slot. The AIC can issue the first two PV products
-without a TILE_DONE wait, then waits for both AIVs to consume PV from two tiles
+also releases the score slot. The AIC can issue the first three PV products
+without a TILE_DONE wait, then waits for both AIVs to consume PV from three tiles
 earlier before writing to that same slot. At the end of a query tile it drains
 only the outstanding releases before resetting the relay indices.
 
@@ -62,12 +63,11 @@ The AIC alternates two L0C slots across QK and PV products independently of
 the GM slots. Each slot's M_FIX event gates its copy to GM, and its FIX_M
 event gates reuse after that copy.
 
-Each AIV alternates two score buffers and two P views in UB. After queuing a
-tile's P store, it scales the old output with that tile's alpha, then computes
-the next tile's softmax and writes its P to the alternate GM slot before
-waiting for the current PV. The AIV has already consumed the previous PV before
-it reuses either P slot, so Cube has finished reading the old P. Output
-accumulation stays in KV order. On a device trace, compare when tile B's
+Each AIV alternates two score buffers and rotates three P views and three
+alpha vectors in UB. It scales the old output with the current tile's alpha,
+then prepares and publishes up to two later P tiles before waiting for the
+current PV. The AIV has consumed the previous PV from a slot before reusing
+its P buffer. Output accumulation stays in KV order. On a device trace, compare when tile C's
 P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
 steady interval between PV_READY events and the whole call time.
 
@@ -155,7 +155,7 @@ physical HBM traffic. For S=16384, batch*heads=2 it predicts 7240 MiB total for
 
 The 128x128 shape requires CANN compilation and independent device correctness
 and performance validation. The default remains 64x128. Each AIV uses about
-168704 bytes of explicit UB plus the 8 KiB Select workspace, and each AIC uses
+185600 bytes of explicit UB plus the 8 KiB Select workspace, and each AIC uses
 two 64 KiB L0C slots. CPU simulation cannot validate
 device lowering, hardware buffer limits, event synchronization or performance.
 

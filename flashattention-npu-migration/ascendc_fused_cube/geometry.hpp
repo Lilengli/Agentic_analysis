@@ -6,9 +6,9 @@ constexpr uint32_t D=128;
 // Bound the QK work that can sit ahead of a ready PV on the same pipelines.
 constexpr uint32_t ScoreSlots=4;
 constexpr uint32_t QkLookaheadTiles=ScoreSlots-1;
-constexpr uint32_t PvRelaySlots=2;
+constexpr uint32_t PvRelaySlots=3;
 constexpr uint32_t UbScoreSlots=2;
-static_assert(PvRelaySlots==2 && QkLookaheadTiles>=1);
+static_assert(PvRelaySlots>=2 && QkLookaheadTiles>=PvRelaySlots-1);
 constexpr uint32_t SelectScratchBytes=8*1024;
 constexpr uint32_t RelayBytesFor(uint32_t bm, uint32_t bn)
 {
@@ -50,12 +50,12 @@ template<uint32_t BM,uint32_t BN> struct Geometry {
     static constexpr uint32_t CausalMaskWords=Rows*BN/32;
     static constexpr uint32_t CausalMaskBytes=MaskWordsPerAiv(BN)*sizeof(uint32_t);
     static constexpr uint32_t BroadcastBytes=Rows*32;
-    static constexpr uint32_t UbBytes=UbScoreSlots*Rows*BN*4+Rows*BN*2+2*Rows*D*4+Rows*D*2+7*Rows*4
-        +CausalMaskBytes+BroadcastBytes;
+    static constexpr uint32_t UbBytes=UbScoreSlots*Rows*BN*4+(PvRelaySlots-1)*Rows*BN*2
+        +2*Rows*D*4+Rows*D*2+(6+PvRelaySlots)*Rows*4+CausalMaskBytes+BroadcastBytes;
 };
-constexpr uint16_t QK_READY=0, P_READY=1, PV_READY=2, TILE_DONE=3, QK_EXTRA_READY_BASE=4;
-constexpr uint16_t LAST_QK_READY=QK_EXTRA_READY_BASE+ScoreSlots-2;
-constexpr uint16_t RelayFlagStride=LAST_QK_READY+1-P_READY;
-constexpr uint16_t LAST_RELAY_FLAG=TILE_DONE+RelayFlagStride;
-static_assert(QK_READY<P_READY && TILE_DONE<QK_EXTRA_READY_BASE && LAST_RELAY_FLAG<=15);
+// Ordered QK notifications alternate two counters independently of the GM ring.
+constexpr uint16_t QK_READY=0, P_READY=1, PV_READY=2, TILE_DONE=3, QK_ODD_READY=4;
+constexpr uint16_t RelayExtraBase=5, FlagsPerRelaySlot=TILE_DONE-P_READY+1;
+constexpr uint16_t LAST_RELAY_FLAG=RelayExtraBase+(PvRelaySlots-1)*FlagsPerRelaySlot-1;
+static_assert(ScoreSlots%2==0 && LAST_RELAY_FLAG<=10);
 } // namespace CubeFA

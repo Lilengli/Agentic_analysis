@@ -80,14 +80,13 @@ constexpr unsigned kFlagCount = CubeFA::LAST_RELAY_FLAG + 1;
 constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
 
-inline constexpr uint32_t PReadyFlag(uint32_t slot) {
-    return CubeFA::P_READY + slot * CubeFA::RelayFlagStride;
+inline constexpr uint32_t RelayFlag(uint32_t flag, uint32_t slot) {
+    return slot == 0 ? flag : CubeFA::RelayExtraBase + (slot - 1) * CubeFA::FlagsPerRelaySlot +
+        flag - CubeFA::P_READY;
 }
-inline constexpr uint32_t PvReadyFlag(uint32_t slot) {
-    return CubeFA::PV_READY + slot * CubeFA::RelayFlagStride;
-}
-inline constexpr uint32_t TileDoneFlag(uint32_t slot) {
-    return CubeFA::TILE_DONE + slot * CubeFA::RelayFlagStride;
+inline constexpr bool IsRelayFlag(uint32_t flag, uint32_t first_slot_flag) {
+    return flag == first_slot_flag || (flag >= CubeFA::RelayExtraBase &&
+        (flag - CubeFA::RelayExtraBase) % CubeFA::FlagsPerRelaySlot == first_slot_flag - CubeFA::P_READY);
 }
 
 struct Stats {
@@ -187,8 +186,7 @@ inline void AbortGroup(uint32_t group) noexcept {
 
 inline void SetFlag(uint32_t flag) {
     if (flag >= kFlagCount) throw std::runtime_error("mixed simulator: invalid flag");
-    if (context.core == Core::AIV && context.stats &&
-            (flag == PReadyFlag(0) || flag == PReadyFlag(1)))
+    if (context.core == Core::AIV && context.stats && IsRelayFlag(flag, CubeFA::P_READY))
         ++context.stats->p_ready_calls;
     FlagState& state = GroupFlags(context.group);
     {
@@ -206,7 +204,7 @@ inline void WaitFlag(uint32_t flag) {
     if (context.core == Core::AIV) {
         if (flag == CubeFA::QK_READY && context.seen_broadcasts[flag] == 0 && context.stats)
             context.stats->reads_before_first_qk = context.stats->gm_read_elements;
-        if ((flag == PvReadyFlag(0) || flag == PvReadyFlag(1)) && context.stats) {
+        if (IsRelayFlag(flag, CubeFA::PV_READY) && context.stats) {
             auto& stats = *context.stats;
             stats.pv_waits.push_back({stats.gm_read_elements, stats.block_reduce_max_calls,
                 stats.mul_calls, stats.exp_calls, stats.block_reduce_sum_calls, stats.p_ready_calls});
@@ -222,14 +220,13 @@ inline void WaitFlag(uint32_t flag) {
         if (state.aborted) throw std::runtime_error("mixed simulator: group aborted while waiting for AIC broadcast");
         ++context.seen_broadcasts[flag];
     } else {
-        const bool p_ready = flag == PReadyFlag(0) || flag == PReadyFlag(1);
-        const bool tile_done = flag == TileDoneFlag(0) || flag == TileDoneFlag(1);
+        const bool p_ready = IsRelayFlag(flag, CubeFA::P_READY);
+        const bool tile_done = IsRelayFlag(flag, CubeFA::TILE_DONE);
         if ((p_ready || tile_done) && context.stats) {
-            uint64_t sent = state.broadcasts[CubeFA::QK_READY];
-            for (unsigned id = CubeFA::QK_EXTRA_READY_BASE; id <= CubeFA::LAST_QK_READY; ++id)
-                sent += state.broadcasts[id];
-            const uint64_t consumed = context.waited_arrivals[PReadyFlag(0)] +
-                context.waited_arrivals[PReadyFlag(1)];
+            const uint64_t sent = state.broadcasts[CubeFA::QK_READY] + state.broadcasts[CubeFA::QK_ODD_READY];
+            uint64_t consumed = 0;
+            for (unsigned slot = 0; slot < CubeFA::PvRelaySlots; ++slot)
+                consumed += context.waited_arrivals[RelayFlag(CubeFA::P_READY, slot)];
             const uint64_t pending = sent - consumed;
             if (pending > CubeFA::ScoreSlots || (p_ready && pending == 0))
                 throw std::runtime_error("mixed simulator: score queue depth out of bounds");

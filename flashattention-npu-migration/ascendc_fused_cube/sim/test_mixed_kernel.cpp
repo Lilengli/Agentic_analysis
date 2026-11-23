@@ -76,7 +76,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
     Require(aic.pending_qk_at_p_waits == expected_pending,
         "AIC did not fill the expected score slots before waiting for P");
     Require(aic.pending_qk_at_done_waits == expected_pending_before_done,
-        "AIC TILE_DONE waits do not match parity reuse and final drain");
+        "AIC TILE_DONE waits do not match relay slot reuse and final drain");
     Require(aic.mmad_calls == 2 * iterations,
         "AIC group " + std::to_string(group) + " did not issue exactly two Mmad products per KV tile");
     Require(aic.gm_write_elements == iterations * (uint64_t(BM) * BN + uint64_t(BM) * CubeFA::D),
@@ -104,7 +104,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
             const uint64_t scores_prepared = expected_prepared_at_pv_wait[i];
             const auto& snapshot = av->pv_waits[i];
             Require(snapshot.p_ready_calls == scores_prepared,
-                "AIV must publish the next probability tile before waiting for the current PV");
+                "AIV must publish its full probability lookahead before waiting for the current PV");
             Require(snapshot.gm_read_elements == mask_reads + (scores_prepared * BN + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * (BN / 64) * 2,

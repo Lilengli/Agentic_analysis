@@ -10,12 +10,12 @@
 namespace CubeFA {
 __aicore__ inline uint16_t ScoreReadyFlag(uint32_t slot)
 {
-    return slot==0 ? QK_READY : QK_EXTRA_READY_BASE+slot-1;
+    return slot%2==0 ? QK_READY : QK_ODD_READY;
 }
 
 __aicore__ inline uint16_t RelayFlag(uint16_t flag,uint32_t slot)
 {
-    return flag+slot*RelayFlagStride;
+    return slot==0 ? flag : RelayExtraBase+(slot-1)*FlagsPerRelaySlot+flag-P_READY;
 }
 
 template<uint32_t R,uint32_t BN>
@@ -204,9 +204,10 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         static_assert(G::UbBytes+SelectScratchBytes<=192*1024-256);
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB,maskB;
         AscendC::TBuf<AscendC::TPosition::VECCALC> rowMaxBlockB;
-        pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float)); pipe.InitBuffer(pB,R*BN*2);
+        pipe.InitBuffer(sB,UbScoreSlots*ScoreElements*sizeof(float));
+        pipe.InitBuffer(pB,(PvRelaySlots-1)*ScoreElements*sizeof(half));
         pipe.InitBuffer(dB,R*D*4); pipe.InitBuffer(oB,R*D*4); pipe.InitBuffer(ohB,R*D*2);
-        pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,R*4);
+        pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,PvRelaySlots*R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);
         pipe.InitBuffer(maskB,G::CausalMaskBytes);
@@ -234,43 +235,44 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::Duplicate(l,0.0f,R);
             AscendC::Duplicate(m,-3.402823466e+38F,R);
             AscendC::PipeBarrier<PIPE_V>();
-            const int32_t first_key=(qs/BN)*BN;
+            const uint32_t kv_tiles=qs/BN+1;
             const uint32_t score_row_offset=sub*ScoreElements;
-            uint32_t gm_slot=0, ub_slot=0;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
-            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,gm_slot,
+            PrepareScoreTile<R,BN,true>(score_ub,sgm[score_row_offset],maxA,maxB,row_blocks,0,
                 masks[mask_offset]);
             CompleteSoftmax<R,BN>(score_ub,p,m,l,alpha,maxA,sumA,sumB,row_blocks);
             PublishP<R,BN>(pgm,p,0,sub,pipe);
-            for(int32_t ks=first_key;ks>=0;ks-=int32_t(BN),ub_slot^=1) {
-                // Prior Vector work has finished with the alternate score slot and delta.
+            uint32_t prepared=1;
+            for(uint32_t tile=0;tile<kv_tiles;++tile) {
+                const uint32_t pv_slot=tile%PvRelaySlots;
+                // Prior Vector work has finished with the score slots and delta.
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
                 // Rescaling the old output only needs alpha, so queue it before the PV wait.
-                AscendC::Brcb(row_blocks,alpha,R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
+                AscendC::Brcb(row_blocks,alpha[pv_slot*R],R/Fp32Block,AscendC::BrcbRepeatParams(1,8));
                 AscendC::PipeBarrier<PIPE_V>();
                 for (uint32_t col=0;col<D;col+=Fp32Repeat) {
                     AscendC::Mul(out[col],out[col],row_blocks,uint64_t{Fp32Repeat},R,
                         AscendC::BinaryRepeatParams(1,1,0,D/Fp32Block,D/Fp32Block,1));
                 }
-                if (ks>=int32_t(BN)) {
-                    gm_slot=gm_slot+1==ScoreSlots ? 0 : gm_slot+1;
+                for(;prepared<kv_tiles && prepared<tile+PvRelaySlots;++prepared) {
+                    const uint32_t gm_slot=prepared%ScoreSlots;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
-                    // QK for the next tile is issued before AIC waits for this P_READY.
-                    const uint32_t next_slot=ub_slot^1;
-                    auto next_s=score_ub[next_slot*ScoreElements];
-                    auto next_p=next_slot==0 ? p : oh;
+                    const uint32_t next_slot=prepared%PvRelaySlots;
+                    auto next_s=score_ub[(prepared%UbScoreSlots)*ScoreElements];
+                    // The previous PV from this slot was consumed before reusing its P and alpha.
+                    auto next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
                     PrepareScoreTile<R,BN,false>(next_s,sgm[next_score_offset+score_row_offset],
                         maxA,maxB,row_blocks,gm_slot,masks);
-                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha,maxA,sumA,sumB,row_blocks);
+                    CompleteSoftmax<R,BN>(next_s,next_p,m,l,alpha[next_slot*R],maxA,sumA,sumB,row_blocks);
                     PublishP<R,BN>(pgm,next_p,next_slot,sub,pipe);
                 }
-                AscendC::CrossCoreWaitFlag(RelayFlag(PV_READY,ub_slot));
-                AscendC::DataCopy(delta,dgm[ub_slot*BM*D+sub*R*D],R*D);
+                AscendC::CrossCoreWaitFlag(RelayFlag(PV_READY,pv_slot));
+                AscendC::DataCopy(delta,dgm[pv_slot*BM*D+sub*R*D],R*D);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(out,out,delta,R*D);
-                AscendC::CrossCoreSetFlag<0x2,PIPE_V>(RelayFlag(TILE_DONE,ub_slot));
+                AscendC::CrossCoreSetFlag<0x2,PIPE_V>(RelayFlag(TILE_DONE,pv_slot));
                 AscendC::PipeBarrier<PIPE_V>();
             }
             Sync<AscendC::HardEvent::V_S>(pipe);
