@@ -141,7 +141,8 @@ struct FlagState {
     std::mutex mutex;
     std::condition_variable changed;
     std::array<uint64_t, kFlagCount> broadcasts{};
-    std::array<uint64_t, kFlagCount> arrivals{};
+    std::array<std::array<uint64_t, kFlagCount>, kAivCount> arrivals{};
+    std::array<bool, CubeFA::PvRelaySlots> pv_pending{};
     bool aborted = false;
 };
 inline std::mutex groups_mutex;
@@ -194,8 +195,19 @@ inline void SetFlag(uint32_t flag) {
     FlagState& state = GroupFlags(context.group);
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (context.core == Core::AIC) ++state.broadcasts[flag];
-        else ++state.arrivals[flag];
+        if (context.core == Core::AIC) {
+            if (IsRelayFlag(flag, CubeFA::PV_READY)) {
+                for (unsigned slot=0;slot<CubeFA::PvRelaySlots;++slot) {
+                    if(flag!=RelayFlag(CubeFA::PV_READY,slot)) continue;
+                    if(state.pv_pending[slot])
+                        throw std::runtime_error("mixed simulator: PV slot reused before TILE_DONE");
+                    state.pv_pending[slot]=true;
+                }
+            }
+            ++state.broadcasts[flag];
+        } else {
+            ++state.arrivals[context.sub][flag];
+        }
     }
     state.changed.notify_all();
 }
@@ -239,9 +251,9 @@ inline void WaitFlag(uint32_t flag) {
             if (p_ready)
                 context.stats->prefetched_v_at_p_wait.push_back(context.stats->prefetched_v_elements);
         }
-        const uint64_t target = (context.waited_arrivals[flag] + 1) * kAivCount;
+        const uint64_t target = context.waited_arrivals[flag] + 1;
         if (!state.changed.wait_for(lock, kWaitTimeout, [&] {
-                return state.aborted || state.arrivals[flag] >= target;
+                return state.aborted || (state.arrivals[0][flag] >= target && state.arrivals[1][flag] >= target);
             })) {
             state.aborted = true;
             state.changed.notify_all();
@@ -249,6 +261,14 @@ inline void WaitFlag(uint32_t flag) {
         }
         if (state.aborted) throw std::runtime_error("mixed simulator: group aborted while waiting for AIV arrivals");
         ++context.waited_arrivals[flag];
+        if(tile_done) {
+            for(unsigned slot=0;slot<CubeFA::PvRelaySlots;++slot) {
+                if(flag!=RelayFlag(CubeFA::TILE_DONE,slot)) continue;
+                if(!state.pv_pending[slot])
+                    throw std::runtime_error("mixed simulator: TILE_DONE without outstanding PV");
+                state.pv_pending[slot]=false;
+            }
+        }
     }
 }
 

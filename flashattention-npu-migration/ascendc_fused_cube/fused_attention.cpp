@@ -1,8 +1,10 @@
 #include <torch/extension.h>
 #include <c10/core/DeviceGuard.h>
+#include <pybind11/stl.h>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "acl/acl.h"
@@ -29,7 +31,8 @@ at::Tensor GetCausalMask(c10::Device device,int64_t bm,int64_t bn)
 } // namespace
 
 at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
-    int64_t bm=64,int64_t bn=128,int64_t groups=24,bool prefetch_pv_v=false)
+    int64_t bm=64,int64_t bn=128,int64_t groups=24,std::optional<bool> prefetch_pv_v=std::nullopt,
+    bool cross_query=false)
 {
     TORCH_CHECK(q.device().type()==c10::DeviceType::PrivateUse1 && q.device()==k.device() && q.device()==v.device(),"same NPU required");
     TORCH_CHECK(q.dim()==4 && q.sizes()==k.sizes() && q.sizes()==v.sizes(),"matching BNSD tensors required");
@@ -39,7 +42,10 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn) ||
         (bm==128 && bn==512),"BM32/64/128 BN64/128 with BM<=BN, or experimental BM128/BN512 required");
     TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 && q.size(2)%bn==0 && q.size(3)==128,"S<=16384 divisible by BN and D128 required");
-    TORCH_CHECK(!prefetch_pv_v || (bm==128 && bn==512),"prefetch_pv_v requires BM128/BN512");
+    const bool stack512=bm==128 && bn==512;
+    const bool prefetch_v=prefetch_pv_v.value_or(stack512);
+    TORCH_CHECK(!prefetch_v || stack512,"prefetch_pv_v requires BM128/BN512");
+    TORCH_CHECK(!cross_query || prefetch_v,"cross_query requires BM128/BN512 with V prefetch");
     TORCH_CHECK(groups>0 && groups<=24,"groups must be 1..24");
     const int64_t heads=q.size(0)*q.size(1);
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
@@ -64,7 +70,8 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==128 && bn==128) CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
-    else if(prefetch_pv_v) CubeFA::fused_cube_attention<128,512,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(cross_query) CubeFA::fused_cube_attention<128,512,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(prefetch_v) CubeFA::fused_cube_attention<128,512,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else CubeFA::fused_cube_attention<128,512><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     return out;
 }
@@ -91,7 +98,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
     m.def("product",&product,pybind11::arg("a"),pybind11::arg("b"),pybind11::arg("transpose_b")=false);
     m.def("forward",&forward,pybind11::arg("q"),pybind11::arg("k"),pybind11::arg("v"),
         pybind11::arg("block_m")=64,pybind11::arg("block_n")=128,pybind11::arg("blocks")=24,
-        pybind11::arg("prefetch_pv_v")=false);
+        pybind11::arg("prefetch_pv_v")=pybind11::none(),pybind11::arg("cross_query")=false);
     m.def("metadata",[](){
         pybind11::dict d;
         d["engine"]="AIC Cube + two AIV per group; QK and PV use Mmad";
@@ -114,6 +121,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["score_row_sum"]="two-stage BlockReduceSum";
         d["stack512_score_row_reductions"]="three-stage BlockReduceMax and BlockReduceSum";
         d["stack512_vector_batch_rows"]=CubeFA::Geometry<128,512>::BatchRows;
+        d["stack512_default_prefetch_pv_v"]=true;
         d["stack512_cube_kv_per_mmad"]=CubeFA::Geometry<128,512>::CubeKv;
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=CubeFA::PvRelaySlots-1;

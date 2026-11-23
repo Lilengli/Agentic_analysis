@@ -220,3 +220,22 @@ Run the same BM128/BN512 benchmark with and without `--prefetch-pv-v`.
 A 1536 / core9 simulator comparison can show the V loads on MTE2 before
 P_READY and how much of their time overlaps the wait. Only the 16K board
 timings can determine whether the new reads help the full kernel.
+
+### Cross-query QK overlap (BM128/BN512)
+
+V prefetch is the default for BM128/BN512. In the 16K two-head board
+comparison, it changed the event median from 1155.00 to 1145.52 us.
+Use `--no-prefetch-pv-v` to select the earlier baseline.
+
+`--cross-query` builds on V prefetch. Once Cube has issued all PVs for
+a query block, it can submit the first QK stacks of the next query while
+Vector is still consuming the preceding PV results or writing its final
+output. Cube still waits for both AIVs' TILE_DONE before reusing each PV
+relay slot; it drains the outstanding slots when the group's last query
+ends. Vector processes one query at a time, so no additional UB state,
+GM relay slots, or cross-core flag IDs are needed.
+
+Compare BM128/BN512 with and without `--cross-query` in the same build.
+For an instruction comparison, use a group with at least two query
+blocks, such as S=1536, H=1, 10 groups and core0 (tasks 0 and 10).
+A group with only one query block cannot show the new overlap.

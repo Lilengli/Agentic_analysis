@@ -199,12 +199,13 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false>
+template<int Core,uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
     static_assert(!PrefetchV || (BM==128 && BN==512));
+    static_assert(!CrossQuery || PrefetchV);
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -248,6 +249,8 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
         int32_t accum_slot=0;
+        // Cross-query mode carries ownership of each PV relay slot across tasks.
+        uint32_t pending_pv=0;
         for(uint32_t task=group;task<tasks;task+=groups) {
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
@@ -276,7 +279,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     pv_bl=pvVB.template Get<half>();
                     PrefetchPvV<CubeKv,D,BN>(pipe,vgm[base+uint64_t(pv_key)*D],pv_bl);
                 }
-                if (issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
+                if constexpr(CrossQuery) {
+                    if(pending_pv & (1u<<pv_slot))
+                        AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
+                } else {
+                    if(issued_pv>=PvRelaySlots) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,pv_slot));
+                }
                 AscendC::CrossCoreWaitFlag(RelayFlag(P_READY,pv_slot));
                 // Accumulate all KV slices in the same FP32 L0C slot before Fixpipe.
                 for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
@@ -290,10 +298,20 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
                 ++issued_pv;
+                if constexpr(CrossQuery) pending_pv|=1u<<pv_slot;
             }
-            const uint32_t first_pending=issued_pv>PvRelaySlots ? issued_pv-PvRelaySlots : 0;
-            for(uint32_t tile=first_pending;tile<issued_pv;++tile)
-                AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,tile%PvRelaySlots));
+            if constexpr(!CrossQuery) {
+                const uint32_t first_pending=issued_pv>PvRelaySlots ? issued_pv-PvRelaySlots : 0;
+                for(uint32_t tile=first_pending;tile<issued_pv;++tile)
+                    AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,tile%PvRelaySlots));
+            }
+            // All P waits are consumed, so both AIVs have read the prior scores.
+            // The next query's QK can safely reuse the score slots while its
+            // predecessor's last PVs are still being consumed.
+        }
+        if constexpr(CrossQuery) {
+            for(uint32_t slot=0;slot<PvRelaySlots;++slot)
+                if(pending_pv & (1u<<slot)) AscendC::CrossCoreWaitFlag(RelayFlag(TILE_DONE,slot));
         }
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
@@ -391,13 +409,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PrefetchV=false>
+template<uint32_t BM,uint32_t BN,bool PrefetchV=false,bool CrossQuery=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PrefetchV>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PrefetchV,CrossQuery>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA
