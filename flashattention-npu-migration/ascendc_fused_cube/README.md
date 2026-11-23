@@ -258,3 +258,20 @@ Compare `--pv-row32` and `--pv-row32-batch-fix` with the same BN512 input
 and build. Run without either option to include the original BN512 baseline.
 Use the profiler separately to confirm the device emits four PV stores per
 stack (plus the four QK stores).
+
+### Prioritize the oldest P writeback (BM128/BN512)
+
+`--prioritize-p-writeback` changes the Cube submission order to give the
+oldest stack's P stores time to complete before issuing a later QK stack.
+For three visible stacks A, B and C, the original order is QK(A), QK(B),
+QK(C), wait for P(A), then PV(A). The experiment starts with QK(A) and QK(B),
+waits for both AIV P(A) writes, submits PV(A), then submits QK(C).
+The same order repeats for subsequent stacks. This is per-group scheduling;
+it does not set device-wide memory arbitration priority.
+
+The four PV MMADs still accumulate in one L0C slot and use one Fixpipe.
+The P and score transfer sizes, relay memory, and AIV schedule are unchanged.
+Compare both modes at the same 16K shape without profiler overhead. In a
+matched 1536 / core9 simulator trace, compare A's final two MTE3 P writes
+and the position of the first QK(C) score store. Faster P stores on their own
+do not guarantee faster attention; reduced QK lookahead can add idle time.

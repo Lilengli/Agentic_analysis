@@ -206,13 +206,34 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     }
 }
 
-template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false>
+template<uint32_t BM,uint32_t BN>
+__aicore__ inline void EmitQkStack(AscendC::TPipe& pipe,
+    AscendC::GlobalTensor<half> q,AscendC::GlobalTensor<half> k,
+    AscendC::GlobalTensor<float> score,AscendC::LocalTensor<half> ql,
+    AscendC::LocalTensor<half> bl,AscendC::LocalTensor<half> a0,
+    AscendC::LocalTensor<half> b0,AscendC::LocalTensor<float> c0,
+    int32_t& accum_slot,uint32_t score_slot,bool load_q)
+{
+    constexpr uint32_t CubeKv=Geometry<BM,BN>::CubeKv;
+    constexpr uint32_t L0CStride=BM*(CubeKv>D ? CubeKv : D);
+    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
+        Gemm<true>(pipe,q,k[kv*D],score[kv],ql,bl,a0,b0,c0[accum_slot*L0CStride],
+            BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
+            Catlass::layout::ColumnMajor(D,CubeKv,D),load_q && kv==0,
+            accum_slot,BN);
+        accum_slot^=1;
+    }
+    AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(score_slot));
+}
+
+template<int Core,uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false,bool PrioritizeP=false>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
     static_assert(!PvRow32 || (BM==128 && BN==PvFullKv));
     static_assert(!BatchFix || PvRow32);
+    static_assert(!PrioritizeP || (BM==128 && BN==512 && !PvRow32));
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
@@ -263,20 +284,17 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint64_t base=uint64_t(head)*seq*D;
             constexpr int32_t step=BN;
             const int32_t first_key=(qs/BN)*BN;
+            // Keep two stacks in front of PV, then wait for the oldest P
+            // before submitting any newer score writeback on this group.
+            constexpr int32_t QkLead=PrioritizeP ? 2 : QkLookaheadTiles;
             uint32_t slot=0, issued_pv=0;
-            for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
+            for (int32_t qk_key=first_key, pv_key=first_key+QkLead*step;
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
-                if (qk_key>=0) {
-                    const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
-                    for(uint32_t kv=0;kv<BN;kv+=CubeKv) {
-                        Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+(uint64_t(qk_key)+kv)*D],
-                            sgm[score_offset+kv],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
-                            BM,CubeKv,D,Catlass::layout::RowMajor(BM,D),
-                            Catlass::layout::ColumnMajor(D,CubeKv,D),qk_key==first_key && kv==0,
-                            accum_slot,BN);
-                        accum_slot^=1;
-                    }
-                    AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(ScoreReadyFlag(slot));
+                const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
+                if(qk_key>=0 && (!PrioritizeP || pv_key>first_key)) {
+                    EmitQkStack<BM,BN>(pipe,qgm[base+uint64_t(qs)*D],
+                        kgm[base+uint64_t(qk_key)*D],sgm[score_offset],
+                        ql,bl,a0,b0,c0,accum_slot,slot,qk_key==first_key);
                 }
                 // Prime the score queue before the first PV.
                 if (pv_key>first_key) continue;
@@ -319,6 +337,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 }
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
                 ++issued_pv;
+                if constexpr(PrioritizeP) {
+                    if(qk_key>=0) {
+                        EmitQkStack<BM,BN>(pipe,qgm[base+uint64_t(qs)*D],
+                            kgm[base+uint64_t(qk_key)*D],sgm[score_offset],
+                            ql,bl,a0,b0,c0,accum_slot,slot,false);
+                    }
+                }
             }
             const uint32_t first_pending=issued_pv>PvRelaySlots ? issued_pv-PvRelaySlots : 0;
             for(uint32_t tile=first_pending;tile<issued_pv;++tile)
@@ -420,13 +445,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
 }
 
 #ifndef CUBE_FA_CPU_SIM
-template<uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false>
+template<uint32_t BM,uint32_t BN,bool PvRow32=false,bool BatchFix=false,bool PrioritizeP=false>
 __global__ __mix__(1,2) void fused_cube_attention(uint64_t sync_base,
     GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR out,GM_ADDR relay,GM_ADDR causal_masks,
     uint32_t heads,uint32_t seq,uint32_t groups)
 {
     AscendC::SetSyncBaseAddr(sync_base);
-    RunCore<g_coreType,BM,BN,PvRow32,BatchFix>(q,k,v,out,relay,causal_masks,heads,seq,groups);
+    RunCore<g_coreType,BM,BN,PvRow32,BatchFix,PrioritizeP>(q,k,v,out,relay,causal_masks,heads,seq,groups);
 }
 #endif
 } // namespace CubeFA
