@@ -20,7 +20,7 @@ def main():
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--heads', type=int, default=2)
     p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
-    p.add_argument('--block-n', type=int, choices=(64, 128), default=128)
+    p.add_argument('--block-n', type=int, choices=(64, 128, 256), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
     p.add_argument('--rows', type=int, default=64)
     p.add_argument('--seeds', type=int, nargs='+', default=(1234, 4321))
@@ -31,6 +31,8 @@ def main():
     p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
     a = p.parse_args()
+    if a.block_n == 256 and a.block_m != 64:
+        p.error('--block-n 256 requires --block-m 64')
     if not (0 < a.seq <= 16384 and a.seq % a.block_n == 0 and 0 < a.blocks <= 24
             and a.block_m <= a.block_n and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: require 0<S<=16384 divisible by BN, groups 1..24, positive counts')
@@ -49,7 +51,7 @@ def main():
     implementation = dict(fused_cube_ext.metadata())
     print('implementation:', implementation, flush=True)
     from verify_products import run_checks
-    run_checks()
+    run_checks(include_wide=a.block_n == 256)
     shape = (a.batch, a.heads, a.seq, 128)
     indices = torch.linspace(0, a.seq-1, min(a.rows, a.seq)).long().unique()
     checks = []

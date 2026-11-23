@@ -4,11 +4,11 @@ import torch_npu  # noqa: F401
 import fused_cube_ext
 
 
-def run_checks():
+def run_checks(*, include_wide=False):
     with torch.inference_mode():
         for bm in (32,64,128):
-            for bn in (64,128):
-                if bm > bn:
+            for bn in (64,128,256):
+                if bm > bn or (bn == 256 and (bm != 64 or not include_wide)):
                     continue
                 for transpose in (True,False):
                     k,n=(128,bn) if transpose else (bn,128)
@@ -35,4 +35,4 @@ def run_checks():
 
 
 if __name__=='__main__':
-    run_checks()
+    run_checks(include_wide=True)

@@ -122,7 +122,7 @@ void CheckStats(uint32_t group, uint32_t groups, uint32_t heads, uint32_t seq,
         const uint64_t reduce_calls = iterations * (BN / 64);
         Require(av->block_reduce_max_calls == 2 * reduce_calls && av->block_reduce_sum_calls == 2 * reduce_calls,
             "AIV reduction calls do not match the score tile width");
-        Require(av->max_calls == iterations * (BN == 128 ? 2 : 1),
+        Require(av->max_calls == iterations * (BN / 64),
             "AIV must combine the split maxima and update the running maxima as vectors");
         Require(av->brcb_calls == 2 * iterations && av->sub_calls == iterations * (1 + BN / 64),
             "AIV must broadcast both the updated maxima and the output rescale factors");
@@ -274,6 +274,8 @@ int main(int argc, char** argv) {
         CheckShape<128, 128>();
         Check<128, 128>(512, 1, 3, 0);
         Check<32, 64>(640, 1, 3, 0);
+        Check<64, 256>(256, 2, 3, 0);
+        Check<64, 256>(2560, 1, 3, 0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
