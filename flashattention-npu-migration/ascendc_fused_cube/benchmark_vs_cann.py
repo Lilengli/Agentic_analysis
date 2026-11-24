@@ -57,6 +57,48 @@ def check_output(torch, output, shape, indices, reference, label):
     return (selected - reference).abs().max().item()
 
 
+def cann_attention(torch_npu, q, k, v, mask):
+    return torch_npu.npu_fusion_attention(
+        q, k, v, HEADS, 'BNSD', atten_mask=mask, scale=SCALE, keep_prob=1.0,
+        pre_tockens=2147483647, next_tockens=0, inner_precise=0, sparse_mode=2,
+    )[0]
+
+
+def trace_once(torch, torch_npu, device, args):
+    if args.trace_once == 'generated':
+        from fused_cube_ext import forward as generated_forward
+        from run import verify_build
+
+        verify_build()
+    seq, = args.seqs
+    shape = (BATCH, HEADS, seq, HEAD_DIM)
+    blocks = min(args.max_blocks, BATCH * HEADS * (seq // GENERATED['block_m']))
+    torch.manual_seed(args.seed)
+    with torch.inference_mode():
+        cpu_qkv = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
+        q, k, v = [tensor.to(device) for tensor in cpu_qkv]
+        if args.trace_once == 'cann':
+            mask = torch.ones((2048, 2048), dtype=torch.bool).triu_(1).to(device)
+        torch.npu.synchronize()
+        print(f'Launching {args.trace_once} once at S={seq}', flush=True)
+        if args.trace_once == 'cann':
+            output = cann_attention(torch_npu, q, k, v, mask)
+        else:
+            output = generated_forward(q, k, v, blocks=blocks, **{**GENERATED, 'block_n': 1024})
+        torch.npu.synchronize()
+        indices = torch.linspace(0, seq - 1, min(args.rows, seq)).round().long().unique()
+        reference = causal_reference(torch, *cpu_qkv, indices)
+        error = check_output(torch, output, shape, indices.to(device), reference, args.trace_once)
+
+    report = {'implementation': args.trace_once, 'shape': shape, 'dtype': 'fp16',
+              'causal': True, 'seed': args.seed, 'query_rows_checked': indices.tolist(),
+              'correct': True, 'max_abs_error': error}
+    if args.trace_once == 'generated':
+        report.update(blocks=blocks, block_n=1024)
+    save_report(args.output, report)
+    print(f'TRACE_COMPLETE {args.trace_once} S={seq} correct=True max_abs={error:.8g}', flush=True)
+
+
 def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args, *, flash_attn_func=None):
     shape = (BATCH, HEADS, seq, HEAD_DIM)
     handwritten = flash_attn_func is not None
@@ -81,10 +123,7 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
         return fused_cube_ext.forward(q, k, v, blocks=blocks, **{**GENERATED, 'block_n': block_n})
 
     def cann():
-        return torch_npu.npu_fusion_attention(
-            q, k, v, HEADS, 'BNSD', atten_mask=mask, scale=SCALE, keep_prob=1.0,
-            pre_tockens=2147483647, next_tockens=0, inner_precise=0, sparse_mode=2,
-        )[0]
+        return cann_attention(torch_npu, q, k, v, mask)
 
     def verify(output, name, stage):
         if name == 'handwritten':
@@ -166,14 +205,20 @@ def main():
     mode.add_argument('--handwritten-source', type=Path, help='compare a flash-attention-npu source checkout')
     mode.add_argument('--compare-stack-widths', action='store_true',
                       help='benchmark generated BN512 and BN1024 on the same inputs as CANN')
+    mode.add_argument('--trace-once', choices=('cann', 'generated'),
+                      help='launch and verify one CANN or generated BN1024 call for CAModel')
     parser.add_argument('--rows', type=int, default=64)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--warmup', type=int, default=5)
     parser.add_argument('--repeat', type=int, default=20)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.trace_once and len(args.seqs) != 1:
+        parser.error('--trace-once requires one explicitly selected --seqs length')
     if args.output is None:
-        if args.compare_stack_widths:
+        if args.trace_once:
+            filename = f'trace_{args.trace_once}_{args.seqs[0]}_check.json'
+        elif args.compare_stack_widths:
             filename = 'flash_attention_stack_widths.json'
         else:
             filename = 'handwritten_vs_cann_256_to_16k.json' if args.handwritten_source else 'flash_attention_256_to_16k.json'
@@ -195,6 +240,9 @@ def main():
         raise RuntimeError('No NPU is visible')
     device = torch.device(f'npu:{args.device}')
     torch.npu.set_device(device)
+    if args.trace_once:
+        trace_once(torch, torch_npu, device, args)
+        return
     flash_attn_func = None
     fused_cube_ext = None
     candidate = 'generated'

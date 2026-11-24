@@ -6,7 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <tuple>
-#ifdef CUBE_FA_TRACE_MIDDLE
+#ifdef CUBE_FA_SIM_ZERO_FFTS
 #include <cstdlib>
 #include <cstring>
 #endif
@@ -75,7 +75,7 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     void* sync_ptr=nullptr;
     const auto error=aclrtGetHardwareSyncAddr(&sync_ptr);
     bool allow_zero_sync=false;
-#ifdef CUBE_FA_TRACE_MIDDLE
+#ifdef CUBE_FA_SIM_ZERO_FFTS
     const char* simulator=std::getenv("IS_SIMULATOR_ENV");
     const char* allow_zero=std::getenv("CUBE_FA_SIM_ALLOW_ZERO_FFTS");
     allow_zero_sync=simulator && std::strcmp(simulator,"true")==0 &&

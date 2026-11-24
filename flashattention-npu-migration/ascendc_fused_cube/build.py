@@ -17,6 +17,7 @@ root = Path(__file__).resolve().parent
 parser=argparse.ArgumentParser()
 parser.add_argument('--catlass-root', type=Path)
 parser.add_argument('--trace-middle', action='store_true', help='enable CAModel markers for a middle KV window')
+parser.add_argument('--simulator', action='store_true', help='enable CAModel launch without instruction markers')
 a=parser.parse_args()
 base=Path('/inspire/sj-ssd3/global_user/260108540217')
 external=a.catlass_root or (Path(os.environ['CATLASS_ROOT']) if os.environ.get('CATLASS_ROOT') else None)
@@ -44,6 +45,8 @@ so = root/('fused_cube_ext' + sysconfig.get_config_var('EXT_SUFFIX'))
 compile_cmd = ['bisheng', '-O2', '-x', 'asc', '--npu-arch=dav-2201',
                '--cce-auto-infer-kernel-type=false', '-fPIC', '-std=c++17',
                f'-D_GLIBCXX_USE_CXX11_ABI={abi}', '-DTORCH_EXTENSION_NAME=fused_cube_ext', '-DCATLASS_ARCH=2201', '-DK_MAX_SHAPE_DIM=0']
+if a.simulator or a.trace_middle:
+    compile_cmd += ['-DCUBE_FA_SIM_ZERO_FFTS']
 if a.trace_middle:
     compile_cmd += ['-DASCENDC_TRACE_ON', '-DCUBE_FA_TRACE_MIDDLE']
 compile_cmd += [f'-I{p}' for p in includes] + ['-c', str(root/'fused_attention.cpp'), '-o', str(obj)]
