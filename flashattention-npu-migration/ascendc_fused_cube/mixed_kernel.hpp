@@ -265,6 +265,13 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
     const uint32_t sub=AscendC::GetSubBlockIdx();
     const uint32_t tiles=seq/BM, tasks=heads*tiles;
+#ifdef CUBE_FA_TRACE_MIDDLE
+    // Both stack widths mark the same 2048 KV tokens on one query in head zero.
+    const bool trace_middle=G::Stacked && TrimDiagonal && seq>=4096;
+    const uint32_t trace_task=tiles*3/4;
+    const int32_t trace_kv_begin=(seq/4096)*1024;
+    const int32_t trace_kv_end=trace_kv_begin+2048;
+#endif
     const uint64_t offset=uint64_t(group)*G::RelayBytes;
     AscendC::GlobalTensor<half> qgm,kgm,vgm,ogm,pgm;
     AscendC::GlobalTensor<float> sgm,dgm;
@@ -317,6 +324,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             uint32_t slot=0, issued_pv=0;
             for (int32_t qk_key=first_key, pv_key=first_key+int32_t(QkLookaheadTiles)*step;
                  pv_key>=0; qk_key-=step, pv_key-=step, slot=slot+1==ScoreSlots ? 0 : slot+1) {
+#ifdef CUBE_FA_TRACE_MIDDLE
+                if(trace_middle && task==trace_task && qk_key==trace_kv_end-step) {
+                    TRACE_START(0x0);
+                }
+#endif
                 if (qk_key>=0) {
                     const uint32_t score_offset=slot ? second_score+(slot-1)*BM*BN : 0;
                     const uint32_t qk_kv=qk_key==first_key ? diagonal_kv : BN;
@@ -357,6 +369,11 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 }
                 accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(RelayFlag(PV_READY,pv_slot));
+#ifdef CUBE_FA_TRACE_MIDDLE
+                if(trace_middle && task==trace_task && pv_key==trace_kv_begin) {
+                    TRACE_STOP(0x0);
+                }
+#endif
                 ++issued_pv;
                 if constexpr(CrossQuery) pending_pv|=1u<<pv_slot;
             }
@@ -447,6 +464,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                         AscendC::BinaryRepeatParams(1,1,0,D/Fp32Block,D/Fp32Block,1));
                 }
                 for(;prepared<kv_tiles && prepared<tile+PvRelaySlots;++prepared) {
+#ifdef CUBE_FA_TRACE_MIDDLE
+                    if(trace_middle && task==trace_task &&
+                       (kv_tiles-1-prepared)*BN==uint32_t(trace_kv_end)-BN) {
+                        TRACE_START(0x0);
+                    }
+#endif
                     const uint32_t gm_slot=prepared%ScoreSlots;
                     const uint32_t next_score_offset=gm_slot ? second_score+(gm_slot-1)*BM*BN : 0;
                     const uint32_t next_slot=prepared%PvRelaySlots;
@@ -467,6 +490,12 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(1);
                 AscendC::PipeBarrier<PIPE_V>(); AscendC::Add(out,out,delta,R*D);
                 AscendC::CrossCoreSetFlag<0x2,PIPE_V>(RelayFlag(TILE_DONE,pv_slot));
+#ifdef CUBE_FA_TRACE_MIDDLE
+                if(trace_middle && task==trace_task &&
+                   (kv_tiles-1-tile)*BN==uint32_t(trace_kv_begin)) {
+                    TRACE_STOP(0x0);
+                }
+#endif
                 AscendC::PipeBarrier<PIPE_V>();
             }
             if constexpr(VectorNormalize) {

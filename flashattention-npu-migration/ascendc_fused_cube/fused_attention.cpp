@@ -6,6 +6,10 @@
 #include <mutex>
 #include <optional>
 #include <tuple>
+#ifdef CUBE_FA_TRACE_MIDDLE
+#include <cstdlib>
+#include <cstring>
+#endif
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "acl/acl.h"
 #include "mixed_kernel.hpp"
@@ -70,7 +74,15 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     auto stream=c10_npu::getCurrentNPUStream().stream(true);
     void* sync_ptr=nullptr;
     const auto error=aclrtGetHardwareSyncAddr(&sync_ptr);
-    TORCH_CHECK(error==ACL_SUCCESS && sync_ptr!=nullptr,"aclrtGetHardwareSyncAddr failed: ",error);
+    bool allow_zero_sync=false;
+#ifdef CUBE_FA_TRACE_MIDDLE
+    const char* simulator=std::getenv("IS_SIMULATOR_ENV");
+    const char* allow_zero=std::getenv("CUBE_FA_SIM_ALLOW_ZERO_FFTS");
+    allow_zero_sync=simulator && std::strcmp(simulator,"true")==0 &&
+        allow_zero && std::strcmp(allow_zero,"1")==0;
+#endif
+    TORCH_CHECK(error==ACL_SUCCESS && (sync_ptr!=nullptr || allow_zero_sync),
+        "aclrtGetHardwareSyncAddr failed: ",error);
     const uint64_t sync_base=reinterpret_cast<uint64_t>(sync_ptr);
     auto qp=static_cast<uint8_t*>(q.data_ptr()); auto kp=static_cast<uint8_t*>(k.data_ptr());
     auto vp=static_cast<uint8_t*>(v.data_ptr()); auto op=static_cast<uint8_t*>(out.data_ptr());

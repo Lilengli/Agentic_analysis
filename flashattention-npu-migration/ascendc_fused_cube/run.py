@@ -14,7 +14,7 @@ import torch_npu
 import fused_cube_ext
 
 
-def verify_build():
+def verify_build(*, trace_middle=False):
     root = Path(__file__).resolve().parent
     manifest = json.loads((root/'build_manifest.json').read_text())
     for name in ('fused_attention.cpp', 'mixed_kernel.hpp', 'cube_tiles.hpp', 'geometry.hpp'):
@@ -22,6 +22,9 @@ def verify_build():
             raise RuntimeError('source changed after build; rerun python build.py')
     if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
         raise RuntimeError('loaded extension does not match build manifest')
+    if bool(manifest.get('trace_middle')) != trace_middle:
+        command = 'python build.py --trace-middle' if trace_middle else 'python build.py'
+        raise RuntimeError(f'loaded extension has the wrong trace mode; rerun {command}')
     return manifest
 
 
@@ -51,6 +54,7 @@ def main():
     p.add_argument('--warmup', type=int, default=1)
     p.add_argument('--repeat', type=int, default=3)
     p.add_argument('--verify-only', action='store_true')
+    p.add_argument('--trace-middle', action='store_true', help='launch once for a marked CAModel trace')
     p.add_argument('--profile', help='new output directory for one-call NPU profile')
     p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
@@ -60,7 +64,8 @@ def main():
                        and a.block_m <= a.block_n)
                       or stacked)
     seq_alignment = a.block_m if stacked and a.trim_diagonal else a.block_n
-    if not (0 < a.seq <= 16384 and a.seq % seq_alignment == 0 and 0 < a.blocks <= 24
+    max_seq = 1 << 20 if a.trace_middle else 16384
+    if not (0 < a.seq <= max_seq and a.seq % seq_alignment == 0 and 0 < a.blocks <= 24
             and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
                 f'or BM128 with BN512/1024; S must be divisible by {seq_alignment}, '
@@ -78,12 +83,27 @@ def main():
         p.error('--balance-queries requires --trim-diagonal')
     if a.block_n == 1024 and (not a.balance_queries or a.vector_normalize):
         p.error('--block-n 1024 requires --balance-queries and per-row output normalization')
+    trace_window = None
+    if a.trace_middle:
+        if not (a.seq >= 4096 and a.balance_queries and not a.vector_normalize
+                and len(a.seeds) == 1 and not a.profile):
+            p.error('--trace-middle requires S>=4096, balanced queries, one seed and no --profile')
+        a.verify_only = True
+        query_tile = 3 * (a.seq // a.block_m) // 4
+        wave, group = divmod(query_tile, a.blocks)
+        if wave % 2:
+            group = a.blocks - 1 - group
+        kv_begin = (a.seq // 4096) * 1024
+        trace_window = {'trace_id': 0, 'logical_group': group, 'head': 0,
+                        'query_start': query_tile * a.block_m,
+                        'kv_begin': kv_begin, 'kv_end': kv_begin + 2048}
+        print('CAModel trace window', json.dumps(trace_window), flush=True)
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
             p.error('profile directory must be empty; select a new path')
     print('module:', fused_cube_ext.__file__, flush=True)
-    verify_build()
+    verify_build(trace_middle=a.trace_middle)
     implementation = dict(fused_cube_ext.metadata())
     implementation['pv_v_load_order'] = 'before P_READY' if prefetch_v else 'after P_READY'
     implementation['query_pipeline'] = 'overlap QK with previous PV tail' if a.cross_query else 'drain each query'
@@ -92,10 +112,13 @@ def main():
     implementation['output_normalization'] = (
         'broadcast denominator and vector divide' if a.vector_normalize else 'per-row reciprocal and scale')
     print('implementation:', implementation, flush=True)
-    from verify_products import run_checks
-    run_checks()
+    if not a.trace_middle:
+        from verify_products import run_checks
+        run_checks()
     shape = (a.batch, a.heads, a.seq, 128)
     indices = torch.linspace(0, a.seq-1, min(a.rows, a.seq)).long().unique()
+    if trace_window:
+        indices = torch.cat((indices, torch.tensor([trace_window['query_start']]))).unique()
     checks = []
 
     def call():
@@ -121,11 +144,17 @@ def main():
             q, k, v = [x.to('npu:0') for x in cpu]
             # No .item(), synchronize(), or reference calculation between the
             # input copies and custom call: exercise normal task-queue ordering.
+            if a.trace_middle:
+                print('Launching fused_cube_attention once', flush=True)
             out = call()
             torch.npu.synchronize()
-            scores = cpu[0][:, :, indices, :].float() @ cpu[1].float().transpose(-1, -2) / math.sqrt(128)
-            mask = torch.arange(a.seq).view(1,1,1,-1) > indices.view(1,1,-1,1)
-            ref = torch.softmax(scores.masked_fill(mask, -float('inf')), -1) @ cpu[2].float()
+            if a.trace_middle:
+                from benchmark_vs_cann import causal_reference
+                ref = causal_reference(torch, *cpu, indices)
+            else:
+                scores = cpu[0][:, :, indices, :].float() @ cpu[1].float().transpose(-1, -2) / math.sqrt(128)
+                mask = torch.arange(a.seq).view(1,1,1,-1) > indices.view(1,1,-1,1)
+                ref = torch.softmax(scores.masked_fill(mask, -float('inf')), -1) @ cpu[2].float()
             verify(out, f'seed={seed}')
         wall_ms, event_us = [], []
         if not a.verify_only:
@@ -203,6 +232,8 @@ def main():
               'wall_median_ms': statistics.median(wall_ms) if wall_ms else None,
               'event_median_us': statistics.median(event_us) if event_us else None,
               'profile': profile, 'note': 'Mixed Cube/Vector, bounded GM relay; event time is a stream interval; inspect CSV AIC MAC counters'}
+    if trace_window:
+        result['trace_window'] = trace_window
     Path(a.output).write_text(json.dumps(result, indent=2))
     print('saved:', a.output, flush=True)
     if wall_ms:

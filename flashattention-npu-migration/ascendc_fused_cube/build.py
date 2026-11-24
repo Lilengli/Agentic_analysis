@@ -16,6 +16,7 @@ from dependency import bundled_headers, REVISION, BUNDLE_SHA256
 root = Path(__file__).resolve().parent
 parser=argparse.ArgumentParser()
 parser.add_argument('--catlass-root', type=Path)
+parser.add_argument('--trace-middle', action='store_true', help='enable CAModel markers for a middle KV window')
 a=parser.parse_args()
 base=Path('/inspire/sj-ssd3/global_user/260108540217')
 external=a.catlass_root or (Path(os.environ['CATLASS_ROOT']) if os.environ.get('CATLASS_ROOT') else None)
@@ -43,6 +44,8 @@ so = root/('fused_cube_ext' + sysconfig.get_config_var('EXT_SUFFIX'))
 compile_cmd = ['bisheng', '-O2', '-x', 'asc', '--npu-arch=dav-2201',
                '--cce-auto-infer-kernel-type=false', '-fPIC', '-std=c++17',
                f'-D_GLIBCXX_USE_CXX11_ABI={abi}', '-DTORCH_EXTENSION_NAME=fused_cube_ext', '-DCATLASS_ARCH=2201', '-DK_MAX_SHAPE_DIM=0']
+if a.trace_middle:
+    compile_cmd += ['-DASCENDC_TRACE_ON', '-DCUBE_FA_TRACE_MIDDLE']
 compile_cmd += [f'-I{p}' for p in includes] + ['-c', str(root/'fused_attention.cpp'), '-o', str(obj)]
 link_cmd = ['bisheng', '--npu-arch=dav-2201', '-shared', '-fPIC', str(obj)]
 link_cmd += [f'-L{p}' for p in libs] + ['-ltorch_python', '-ltorch', '-ltorch_cpu', '-lc10', '-ltorch_npu', '-lascendcl', '-o', str(so)]
@@ -56,5 +59,6 @@ manifest['catlass_root']=str(catlass)
 manifest['bundled_catlass_revision']=REVISION
 manifest['bundled_catlass_archive_sha256']=BUNDLE_SHA256
 manifest['catlass_override']=bool(a.catlass_root or os.environ.get('CATLASS_ROOT'))
+manifest['trace_middle']=a.trace_middle
 manifest['module_sha256'] = hashlib.sha256(so.read_bytes()).hexdigest()
 (root/'build_manifest.json').write_text(json.dumps(manifest, indent=2))
