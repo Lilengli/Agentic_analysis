@@ -72,7 +72,7 @@ P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
 steady interval between PV_READY events and the whole call time.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
-S up to 16384, 1..24 AIC groups, BM32/64/128 with BM<=BN and BN64/128, plus
+S up to 16384 in `run.py`, 1..24 AIC groups, BM32/64/128 with BM<=BN and BN64/128, plus
 the experimental BM128/BN512 path. S must be divisible by BN. The BN512
 path with `--trim-diagonal` accepts S divisible by 128.
 The interface uses equal head counts and uniform sequence lengths for
@@ -264,6 +264,11 @@ trimmed BN512 schedule with CANN `FlashAttentionScore` at 256, 512, 1024,
 The generated path uses up to one AIC group per query tile, capped at 24.
 Each length is checked against sampled CPU FP32 results before reporting
 the NPU Event and synchronized wall-clock medians.
+
+For the long-sequence sweep, pass
+`--seqs 32768 65536 131072 262144 524288 1048576`. This uses the same
+trimmed BN512 kernel with a higher sequence limit and computes the sampled
+CPU reference over 16K KV chunks. Use a separate output JSON for the long run.
 
 ### Batch the final output normalization (BM128/BN512)
 

@@ -44,9 +44,10 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     const bool stack512=bm==128 && bn==512;
     // With diagonal trimming, every KV slice ends at or before the query block.
     const int64_t seq_alignment=stack512 && trim_diagonal ? bm : bn;
-    TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 &&
+    const int64_t max_seq=stack512 && trim_diagonal ? (1<<20) : (1<<14);
+    TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=max_seq &&
         q.size(2)%seq_alignment==0 && q.size(3)==128,
-        "S<=16384 divisible by ",seq_alignment," and D128 required");
+        "S<=",max_seq," divisible by ",seq_alignment," and D128 required");
     const bool prefetch_v=prefetch_pv_v.value_or(stack512);
     TORCH_CHECK(!prefetch_v || stack512,"prefetch_pv_v requires BM128/BN512");
     TORCH_CHECK(!cross_query || prefetch_v,"cross_query requires BM128/BN512 with V prefetch");

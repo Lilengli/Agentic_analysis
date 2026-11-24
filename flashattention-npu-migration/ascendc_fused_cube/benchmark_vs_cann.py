@@ -8,7 +8,9 @@ import tempfile
 import time
 
 
-SEQUENCES = (256, 512, 1024, 2048, 4096, 8192, 16384)
+SEQUENCES = tuple(1 << exponent for exponent in range(8, 21))
+DEFAULT_SEQUENCES = SEQUENCES[:7]
+REFERENCE_KV_CHUNK = 16384
 BATCH, HEADS, HEAD_DIM = 1, 2, 128
 SCALE = 1 / math.sqrt(HEAD_DIM)
 GENERATED = {
@@ -22,13 +24,32 @@ GENERATED = {
 }
 
 
+def causal_reference(torch, q, k, v, indices):
+    query = q.index_select(2, indices).float()
+    row_max = torch.full_like(query[..., :1], -math.inf)
+    denominator = torch.zeros_like(row_max)
+    numerator = torch.zeros_like(query)
+    for start in range(0, k.shape[2], REFERENCE_KV_CHUNK):
+        stop = min(start + REFERENCE_KV_CHUNK, k.shape[2])
+        scores = (query @ k[:, :, start:stop].float().transpose(-2, -1)) * SCALE
+        causal = torch.arange(start, stop)[None, :] > indices[:, None]
+        scores.masked_fill_(causal, -math.inf)
+        new_max = torch.maximum(row_max, scores.amax(dim=-1, keepdim=True))
+        # The first chunk contains key 0, so every sampled query has a finite maximum.
+        correction = (row_max - new_max).exp()
+        weights = scores.sub_(new_max).exp_()
+        numerator = numerator * correction + weights @ v[:, :, start:stop].float()
+        denominator = denominator * correction + weights.sum(dim=-1, keepdim=True)
+        row_max = new_max
+    return numerator / denominator
+
+
 def check_output(torch, output, shape, indices, reference, label):
-    actual = output.cpu().float()
-    if tuple(actual.shape) != shape:
-        raise RuntimeError(f'{label}: expected shape {shape}, got {tuple(actual.shape)}')
-    if not torch.isfinite(actual).all().item():
+    if tuple(output.shape) != shape:
+        raise RuntimeError(f'{label}: expected shape {shape}, got {tuple(output.shape)}')
+    if not torch.isfinite(output).all().item():
         raise RuntimeError(f'{label}: output contains NaN or infinity')
-    selected = actual.index_select(2, indices)
+    selected = output.index_select(2, indices).cpu().float()
     torch.testing.assert_close(selected, reference, atol=0.002, rtol=0.01,
                                msg=lambda message: f'{label}: {message}')
     return (selected - reference).abs().max().item()
@@ -41,12 +62,11 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
     torch.manual_seed(args.seed)
     cpu_qkv = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
     indices = torch.linspace(0, seq - 1, min(args.rows, seq)).round().long().unique()
-    scores = (cpu_qkv[0].index_select(2, indices).float()
-              @ cpu_qkv[1].float().transpose(-2, -1)) * SCALE
-    causal = torch.arange(seq)[None, :] > indices[:, None]
-    reference = torch.softmax(scores.masked_fill(causal, -math.inf), dim=-1) @ cpu_qkv[2].float()
+    reference = causal_reference(torch, *cpu_qkv, indices)
     q, k, v = [tensor.to(device) for tensor in cpu_qkv]
+    device_indices = indices.to(device)
     torch.npu.synchronize()
+    del cpu_qkv
 
     def generated():
         return fused_cube_ext.forward(q, k, v, blocks=blocks, **GENERATED)
@@ -62,7 +82,7 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
     for name, call in methods.items():
         stats[name] = {
             'first_max_abs_error': check_output(
-                torch, call(), shape, indices, reference, f'S={seq} {name} first output'),
+                torch, call(), shape, device_indices, reference, f'S={seq} {name} first output'),
             'event_samples_us': [],
             'wall_samples_us': [],
         }
@@ -87,7 +107,7 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
             outputs[name] = out
     for name, item in stats.items():
         item['last_max_abs_error'] = check_output(
-            torch, outputs[name], shape, indices, reference, f'S={seq} {name} last timed output')
+            torch, outputs[name], shape, device_indices, reference, f'S={seq} {name} last timed output')
         item['event_median_us'] = statistics.median(item['event_samples_us'])
         item['wall_median_us'] = statistics.median(item['wall_samples_us'])
         if not math.isfinite(item['event_median_us']) or item['event_median_us'] <= 0:
@@ -115,7 +135,8 @@ def save_report(path, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--seqs', nargs='+', type=int, choices=SEQUENCES, default=SEQUENCES)
+    parser.add_argument('--seqs', nargs='+', type=int, choices=SEQUENCES, default=DEFAULT_SEQUENCES,
+                        help='sequence lengths, default 256 through 16384')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--max-blocks', type=int, choices=range(1, 25), default=24)
     parser.add_argument('--rows', type=int, default=64)
@@ -147,6 +168,7 @@ def main():
         'dtype': 'fp16', 'layout': 'BNSD', 'causal': True,
         'generated_config': GENERATED, 'generated_max_blocks': args.max_blocks,
         'cann_api': 'torch_npu.npu_fusion_attention',
+        'reference_kv_chunk': REFERENCE_KV_CHUNK,
         'warmup': args.warmup, 'repeat': args.repeat, 'seed': args.seed,
         'requested_sequences': list(args.seqs), 'results': [],
     }
