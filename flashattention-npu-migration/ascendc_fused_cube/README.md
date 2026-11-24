@@ -72,10 +72,11 @@ P_READY and PV MMAD occur relative to tile A's TILE_DONE, and measure the
 steady interval between PV_READY events and the whole call time.
 
 Supported: contiguous equal-shaped FP16 BNSD Q/K/V, D128, causal self-attention,
-S divisible by BN and up to 16384; BM32/64/128 with BM<=BN and BN64/128, plus
-the experimental BM128/BN512 path, 1..24 AIC groups. The experimental path
-requires S divisible by 512. No GQA,
-dropout, variable-length tails or backward.
+S up to 16384, 1..24 AIC groups, BM32/64/128 with BM<=BN and BN64/128, plus
+the experimental BM128/BN512 path. S must be divisible by BN. The BN512
+path with `--trim-diagonal` accepts S divisible by 128.
+The interface uses equal head counts and uniform sequence lengths for
+forward inference with zero dropout.
 
 ## Build and run on the target
 
@@ -132,7 +133,8 @@ The semantic suite covers all five tile configurations,
 S128/256, H1/2, groups1/3 and two input repetitions. It also checks S512 with
 BM128/BN128 and S640 with BM32/BN64, including a full score ring and wraparound.
 BM128/BN512 runs at S512 and S2560 to cover all four causal alignments and
-reuse of both relay rings.
+reuse of both relay rings. The balanced, trimmed mode also checks S256 and
+S640 to cover partial 512-token stacks.
 It checks the score ring depth, PV relay reuse waits, and compares results
 against an independent FP64 causal reference with atol=.002 and rtol=.01.
 Other checks cover the number of QK and PV MMADs and the logical GM writes,
@@ -187,9 +189,9 @@ Each AIV handles 64 of the 128 query rows in four 16x512 score chunks. The
 score and P buffers ping-pong between those chunks, and row reductions use
 three stages over the 512 columns. Explicit UB allocation is 184,576 bytes
 per AIV plus the 8 KiB Select workspace. The implementation
-retains four QK score slots in GM and the triple P/PV relay. Every diagonal
-logical stack is processed in full and then causally masked, so sequence length
-must be a multiple of 512. This path is experimental and needs target correctness,
+retains four QK score slots in GM and the triple P/PV relay. Without diagonal
+trimming, the entire diagonal stack is processed before masking and sequence
+length must be a multiple of 512. This path is experimental and needs target correctness,
 profiling and timing validation. The default remains BM64/BN128.
 
 For BM128/BN512, the relay formula accounts for four FP32 score slots and three
@@ -255,6 +257,13 @@ are unchanged.
 For S=16384, each head processes 8448 physical 128-token slices without
 trimming and 8256 with trimming, a 2.27% reduction in QK/PV slice count.
 Benchmark both modes with `--cross-query` enabled to isolate trimming.
+
+After building, run `python -u benchmark_vs_cann.py` to compare the balanced,
+trimmed BN512 schedule with CANN `FlashAttentionScore` at 256, 512, 1024,
+2048, 4096, 8192 and 16384 tokens. Both calls share FP16 causal BNSD inputs.
+The generated path uses up to one AIC group per query tile, capped at 24.
+Each length is checked against sampled CPU FP32 results before reporting
+the NPU Event and synchronized wall-clock medians.
 
 ### Batch the final output normalization (BM128/BN512)
 

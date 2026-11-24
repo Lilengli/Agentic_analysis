@@ -347,6 +347,8 @@ void CheckBalancedQueries() {
     std::printf("PASS balanced assignment for 1..24 groups; 16K slices=%u..%u stacks=%u..%u\n",
         *min_slices, *max_slices, *min_stacks, *max_stacks);
 
+    Check<128, 512, true, true, true, false, true>(256, 2, 4, 0);
+    Check<128, 512, true, true, true, false, true>(640, 2, 7, 0);
     Check<128, 512, true, true, true, false, true>(512, 1, 5, 0);
     Check<128, 512, true, true, true, false, true>(512, 2, 7, 0);
     Check<128, 512, true, true, true, false, true>(1536, 1, 10, 0);

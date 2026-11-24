@@ -41,8 +41,12 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(),"forward inference only");
     TORCH_CHECK(((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn) ||
         (bm==128 && bn==512),"BM32/64/128 BN64/128 with BM<=BN, or experimental BM128/BN512 required");
-    TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 && q.size(2)%bn==0 && q.size(3)==128,"S<=16384 divisible by BN and D128 required");
     const bool stack512=bm==128 && bn==512;
+    // With diagonal trimming, every KV slice ends at or before the query block.
+    const int64_t seq_alignment=stack512 && trim_diagonal ? bm : bn;
+    TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=16384 &&
+        q.size(2)%seq_alignment==0 && q.size(3)==128,
+        "S<=16384 divisible by ",seq_alignment," and D128 required");
     const bool prefetch_v=prefetch_pv_v.value_or(stack512);
     TORCH_CHECK(!prefetch_v || stack512,"prefetch_pv_v requires BM128/BN512");
     TORCH_CHECK(!cross_query || prefetch_v,"cross_query requires BM128/BN512 with V prefetch");

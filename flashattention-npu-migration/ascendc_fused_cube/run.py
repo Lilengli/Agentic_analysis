@@ -14,6 +14,17 @@ import torch_npu
 import fused_cube_ext
 
 
+def verify_build():
+    root = Path(__file__).resolve().parent
+    manifest = json.loads((root/'build_manifest.json').read_text())
+    for name in ('fused_attention.cpp', 'mixed_kernel.hpp', 'cube_tiles.hpp', 'geometry.hpp'):
+        if manifest.get(name) != hashlib.sha256((root/name).read_bytes()).hexdigest():
+            raise RuntimeError('source changed after build; rerun python build.py')
+    if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
+        raise RuntimeError('loaded extension does not match build manifest')
+    return manifest
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--seq', type=int, default=16384)
@@ -44,14 +55,16 @@ def main():
     p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
     a = p.parse_args()
+    stack512 = (a.block_m, a.block_n) == (128, 512)
     supported_tile = ((a.block_m in (32, 64, 128) and a.block_n in (64, 128)
                        and a.block_m <= a.block_n)
-                      or (a.block_m == 128 and a.block_n == 512))
-    if not (0 < a.seq <= 16384 and a.seq % a.block_n == 0 and 0 < a.blocks <= 24
+                      or stack512)
+    seq_alignment = a.block_m if stack512 and a.trim_diagonal else a.block_n
+    if not (0 < a.seq <= 16384 and a.seq % seq_alignment == 0 and 0 < a.blocks <= 24
             and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
-                'or experimental BM128/BN512; S must be divisible by BN, groups 1..24, counts positive')
-    stack512 = (a.block_m, a.block_n) == (128, 512)
+                f'or experimental BM128/BN512; S must be divisible by {seq_alignment}, '
+                'groups 1..24, counts positive')
     prefetch_v = stack512 if a.prefetch_pv_v is None else a.prefetch_pv_v
     if prefetch_v and not stack512:
         p.error('--prefetch-pv-v requires --block-m 128 --block-n 512')
@@ -68,13 +81,7 @@ def main():
         if profile_dir.exists() and any(profile_dir.iterdir()):
             p.error('profile directory must be empty; select a new path')
     print('module:', fused_cube_ext.__file__, flush=True)
-    root = Path(__file__).resolve().parent
-    manifest = json.loads((root/'build_manifest.json').read_text())
-    for name in ('fused_attention.cpp', 'mixed_kernel.hpp', 'cube_tiles.hpp', 'geometry.hpp'):
-        if manifest.get(name) != hashlib.sha256((root/name).read_bytes()).hexdigest():
-            raise RuntimeError('source changed after build; rerun python build.py')
-    if manifest.get('module_sha256') != hashlib.sha256(Path(fused_cube_ext.__file__).read_bytes()).hexdigest():
-        raise RuntimeError('loaded extension does not match build manifest')
+    verify_build()
     implementation = dict(fused_cube_ext.metadata())
     implementation['pv_v_load_order'] = 'before P_READY' if prefetch_v else 'after P_READY'
     implementation['query_pipeline'] = 'overlap QK with previous PV tail' if a.cross_query else 'drain each query'
