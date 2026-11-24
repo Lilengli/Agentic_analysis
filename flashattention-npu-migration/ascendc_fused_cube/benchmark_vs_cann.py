@@ -1,9 +1,11 @@
-"""Benchmark the balanced BN512 kernel and CANN FlashAttentionScore on the same NPU inputs."""
+"""Benchmark the balanced BN512 or handwritten kernel against CANN FlashAttentionScore."""
 import argparse
 import json
 import math
 from pathlib import Path
 import statistics
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -55,20 +57,27 @@ def check_output(torch, output, shape, indices, reference, label):
     return (selected - reference).abs().max().item()
 
 
-def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args):
+def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args, *, flash_attn_func=None):
     shape = (BATCH, HEADS, seq, HEAD_DIM)
-    blocks = min(args.max_blocks, BATCH * HEADS * (seq // GENERATED['block_m']))
-    print(f'S={seq} blocks={blocks}  verifying both kernels', flush=True)
+    handwritten = flash_attn_func is not None
+    candidate = 'handwritten' if handwritten else 'generated'
+    blocks = None if handwritten else min(args.max_blocks, BATCH * HEADS * (seq // GENERATED['block_m']))
+    configuration = 'handwritten BSND' if handwritten else f'blocks={blocks}'
+    print(f'S={seq} {configuration}  verifying both kernels', flush=True)
     torch.manual_seed(args.seed)
     cpu_qkv = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
     indices = torch.linspace(0, seq - 1, min(args.rows, seq)).round().long().unique()
     reference = causal_reference(torch, *cpu_qkv, indices)
     q, k, v = [tensor.to(device) for tensor in cpu_qkv]
+    if handwritten:
+        qb, kb, vb = [tensor.transpose(1, 2).contiguous() for tensor in (q, k, v)]
     device_indices = indices.to(device)
     torch.npu.synchronize()
     del cpu_qkv
 
-    def generated():
+    def run_candidate():
+        if handwritten:
+            return flash_attn_func(qb, kb, vb, dropout_p=0.0, softmax_scale=SCALE, causal=True)
         return fused_cube_ext.forward(q, k, v, blocks=blocks, **GENERATED)
 
     def cann():
@@ -77,12 +86,16 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
             pre_tockens=2147483647, next_tockens=0, inner_precise=0, sparse_mode=2,
         )[0]
 
-    methods = {'generated': generated, 'cann': cann}
+    def verify(output, name, stage):
+        if name == 'handwritten':
+            output = output.transpose(1, 2)
+        return check_output(torch, output, shape, device_indices, reference, f'S={seq} {name} {stage}')
+
+    methods = {candidate: run_candidate, 'cann': cann}
     stats = {}
     for name, call in methods.items():
         stats[name] = {
-            'first_max_abs_error': check_output(
-                torch, call(), shape, device_indices, reference, f'S={seq} {name} first output'),
+            'first_max_abs_error': verify(call(), name, 'first output'),
             'event_samples_us': [],
             'wall_samples_us': [],
         }
@@ -106,18 +119,20 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
             stats[name]['event_samples_us'].append(start.elapsed_time(stop) * 1000)
             outputs[name] = out
     for name, item in stats.items():
-        item['last_max_abs_error'] = check_output(
-            torch, outputs[name], shape, device_indices, reference, f'S={seq} {name} last timed output')
+        item['last_max_abs_error'] = verify(outputs[name], name, 'last timed output')
         item['event_median_us'] = statistics.median(item['event_samples_us'])
         item['wall_median_us'] = statistics.median(item['wall_samples_us'])
         if not math.isfinite(item['event_median_us']) or item['event_median_us'] <= 0:
             raise RuntimeError(f'S={seq} {name}: invalid NPU Event timing')
 
-    return {
-        'seq': seq, 'generated_blocks': blocks, 'query_rows_checked': indices.tolist(),
+    row = {
+        'seq': seq, 'query_rows_checked': indices.tolist(),
         'correct': True, 'methods': stats,
-        'generated_speedup_vs_cann': stats['cann']['event_median_us'] / stats['generated']['event_median_us'],
+        f'{candidate}_speedup_vs_cann': stats['cann']['event_median_us'] / stats[candidate]['event_median_us'],
     }
+    if not handwritten:
+        row['generated_blocks'] = blocks
+    return row
 
 
 def save_report(path, report):
@@ -139,34 +154,65 @@ def main():
                         help='sequence lengths, default 256 through 16384')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--max-blocks', type=int, choices=range(1, 25), default=24)
+    parser.add_argument('--handwritten-source', type=Path, help='compare a flash-attention-npu source checkout')
     parser.add_argument('--rows', type=int, default=64)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--warmup', type=int, default=5)
     parser.add_argument('--repeat', type=int, default=20)
-    parser.add_argument('--output', type=Path, default=Path('flash_attention_256_to_16k.json'))
+    parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.output is None:
+        filename = 'handwritten_vs_cann_256_to_16k.json' if args.handwritten_source else 'flash_attention_256_to_16k.json'
+        args.output = Path(filename)
     if args.rows < 1 or args.repeat < 1 or args.warmup < 0 or args.device < 0:
         parser.error('rows and repeat must be positive; warmup and device must be nonnegative')
     if not args.output.parent.is_dir():
         parser.error(f'output parent directory does not exist: {args.output.parent}')
+    source = args.handwritten_source
+    if source is not None:
+        source = source.expanduser().resolve()
+        if not (source / 'flash_attn_npu' / '__init__.py').is_file():
+            parser.error(f'not a flash-attention-npu source checkout: {source}')
 
     import torch
     import torch_npu
-    import fused_cube_ext
-    from run import verify_build
 
     if not torch.npu.is_available():
         raise RuntimeError('No NPU is visible')
-    manifest = verify_build()
     device = torch.device(f'npu:{args.device}')
     torch.npu.set_device(device)
+    flash_attn_func = None
+    fused_cube_ext = None
+    candidate = 'generated'
+    if source is not None:
+        sys.path.insert(0, str(source))
+        import flash_attn_npu
+
+        flash_attn_func = flash_attn_npu.flash_attn_func
+        candidate = 'handwritten'
+        revision = subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                                  capture_output=True, text=True, check=False)
+        implementation = {
+            'handwritten_source': str(source),
+            'handwritten_source_commit': revision.stdout.strip() if revision.returncode == 0 else None,
+            'handwritten_version': getattr(flash_attn_npu, '__version__', None),
+            'candidate_input_layout': 'preconverted BSND',
+        }
+    else:
+        import fused_cube_ext
+        from run import verify_build
+
+        implementation = {
+            'generated_module_sha256': verify_build()['module_sha256'],
+            'generated_config': GENERATED, 'generated_max_blocks': args.max_blocks,
+            'candidate_input_layout': 'BNSD',
+        }
     report = {
         'device': torch.npu.get_device_name(args.device),
         'torch': str(torch.__version__), 'torch_npu': str(torch_npu.__version__),
-        'generated_module_sha256': manifest['module_sha256'],
+        'candidate': candidate, **implementation,
         'batch': BATCH, 'heads': HEADS, 'head_dim': HEAD_DIM,
         'dtype': 'fp16', 'layout': 'BNSD', 'causal': True,
-        'generated_config': GENERATED, 'generated_max_blocks': args.max_blocks,
         'cann_api': 'torch_npu.npu_fusion_attention',
         'reference_kv_chunk': REFERENCE_KV_CHUNK,
         'warmup': args.warmup, 'repeat': args.repeat, 'seed': args.seed,
@@ -176,13 +222,14 @@ def main():
     with torch.inference_mode():
         mask = torch.ones((2048, 2048), dtype=torch.bool).triu_(1).to(device)
         for seq in args.seqs:
-            row = benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args)
+            row = benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args,
+                                     flash_attn_func=flash_attn_func)
             report['results'].append(row)
             save_report(args.output, report)
-            generated, cann = (row['methods'][name] for name in ('generated', 'cann'))
-            print(f"S={seq:5}  generated={generated['event_median_us']:9.2f} us  "
-                  f"CANN={cann['event_median_us']:9.2f} us  "
-                  f"CANN/generated={row['generated_speedup_vs_cann']:.3f}x", flush=True)
+            item, official = (row['methods'][name] for name in (candidate, 'cann'))
+            print(f"S={seq:5}  {candidate}={item['event_median_us']:9.2f} us  "
+                  f"CANN={official['event_median_us']:9.2f} us  "
+                  f"CANN/{candidate}={row[f'{candidate}_speedup_vs_cann']:.3f}x", flush=True)
     print(f'Saved {args.output}', flush=True)
 
 
