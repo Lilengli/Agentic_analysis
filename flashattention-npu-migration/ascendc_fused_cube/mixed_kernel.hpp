@@ -73,17 +73,26 @@ __aicore__ inline void ReduceFullRepeat(AscendC::LocalTensor<float> dst,
     else AscendC::BlockReduceMax(dst,src,repeats,64,1,1,8);
 }
 
-template<uint32_t Rows,bool Sum>
-__aicore__ inline void ReduceRow512(AscendC::LocalTensor<float> result,
+template<uint32_t Rows,uint32_t BN,bool Sum>
+__aicore__ inline void ReduceStackRows(AscendC::LocalTensor<float> result,
     AscendC::LocalTensor<float> scores,AscendC::LocalTensor<float> partial64,
-    AscendC::LocalTensor<float> partial8)
+    AscendC::LocalTensor<float> partial)
 {
-    // Each block reduces eight FP32 values: 512 -> 64 -> 8 -> 1 per row.
-    ReduceFullRepeat<Sum>(partial64,scores,Rows*8);
+    // Each block reduces eight FP32 values, leaving 8 or 16 per row after two stages.
+    ReduceFullRepeat<Sum>(partial64,scores,Rows*BN/64);
     AscendC::PipeBarrier<PIPE_V>();
-    ReduceFullRepeat<Sum>(partial8,partial64,Rows);
+    ReduceFullRepeat<Sum>(partial,partial64,Rows*BN/512);
     AscendC::PipeBarrier<PIPE_V>();
-    ReduceFullRepeat<Sum>(result,partial8,Rows/8);
+    if constexpr(BN==1024) {
+        // Combine each row's two adjacent blocks into one contiguous block.
+        const AscendC::BinaryRepeatParams strides(1,1,1,1,2,2);
+        if constexpr(Sum) AscendC::Add(partial64,partial,partial[8],uint64_t{8},Rows,strides);
+        else AscendC::Max(partial64,partial,partial[8],uint64_t{8},Rows,strides);
+        AscendC::PipeBarrier<PIPE_V>();
+        ReduceFullRepeat<Sum>(result,partial64,Rows/8);
+    } else {
+        ReduceFullRepeat<Sum>(result,partial,Rows/8);
+    }
 }
 
 template<uint32_t Rows,uint32_t BN,bool ApplyCausalMask>
@@ -99,8 +108,8 @@ __aicore__ inline void TransformScores(AscendC::LocalTensor<float> s, AscendC::L
         AscendC::PipeBarrier<PIPE_V>();
     }
     // The preceding barrier has released the row-block scratch used by output rescale.
-    if constexpr(BN==512) {
-        ReduceRow512<Rows,false>(maxA,s,partial64,row_blocks);
+    if constexpr(BN>128) {
+        ReduceStackRows<Rows,BN,false>(maxA,s,partial64,row_blocks);
     } else {
         ReduceRowMax64<Rows,BN>(maxA,s,row_blocks);
         if constexpr(BN==128) {
@@ -140,8 +149,8 @@ __aicore__ inline void CompleteSoftmax(AscendC::LocalTensor<float> s, AscendC::L
     AscendC::Exp(s,s,R*BN); AscendC::Exp(alpha,alpha,R);
     AscendC::PipeBarrier<PIPE_V>();
     // The preceding barrier releases the scratch used to broadcast row maxima.
-    if constexpr(BN==512) {
-        ReduceRow512<R,true>(sumA,s,partial64,row_blocks);
+    if constexpr(BN>128) {
+        ReduceStackRows<R,BN,true>(sumA,s,partial64,row_blocks);
     } else {
         ReduceRowSum64<R,BN>(sumA,s,row_blocks);
         if constexpr(BN==128) {
@@ -182,7 +191,7 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     uint32_t gm_slot,uint32_t pv_slot,uint32_t sub,AscendC::TPipe& pipe,uint32_t active_kv=BN)
 {
     AscendC::CrossCoreWaitFlag(ScoreReadyFlag(gm_slot));
-    if constexpr(BN!=512) {
+    if constexpr(BN<=128) {
         AscendC::DataCopy(s,scores,Rows*BN);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
@@ -192,7 +201,7 @@ __aicore__ inline void PrepareTile(AscendC::GlobalTensor<float> scores, AscendC:
     } else {
         using G=Geometry<2*Rows,BN>;
         constexpr uint32_t BatchRows=G::BatchRows, Elements=G::BatchElements;
-        static_assert(Rows==4*BatchRows);
+        static_assert(Rows%BatchRows==0 && Rows/BatchRows>=UbScoreSlots);
         if constexpr(TrimDiagonal) {
             static_assert(ApplyCausalMask);
             // Unwritten columns must be initialized before vector arithmetic.
@@ -248,9 +257,9 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,GM_ADDR causal_masks,uint32_t heads,uint32_t seq,uint32_t groups)
 {
     using G=Geometry<BM,BN>;
-    static_assert(!PrefetchV || (BM==128 && BN==512));
+    static_assert(!PrefetchV || G::Stacked);
     static_assert(!CrossQuery || PrefetchV);
-    static_assert(!TrimDiagonal || (BM==128 && BN==512 && CrossQuery));
+    static_assert(!TrimDiagonal || (G::Stacked && CrossQuery));
     static_assert(!VectorNormalize || TrimDiagonal);
     static_assert(!BalanceQueries || TrimDiagonal);
     const uint32_t group=AscendC::GetBlockIdx()/AscendC::GetSubBlockNum();
@@ -381,7 +390,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         pipe.InitBuffer(mB,R*4); pipe.InitBuffer(lB,R*4); pipe.InitBuffer(alphaB,PvRelaySlots*R*4);
         pipe.InitBuffer(maxAB,R*4); pipe.InitBuffer(maxBB,R*4);
         pipe.InitBuffer(sumAB,R*4); pipe.InitBuffer(sumBB,R*4);
-        pipe.InitBuffer(maskB,G::CausalMaskBytes);
+        pipe.InitBuffer(maskB,G::CausalMaskUbWords*sizeof(uint32_t));
         pipe.InitBuffer(rowMaxBlockB,G::BroadcastBytes);
         auto score_ub=sB.template Get<float>(); auto p=pB.template Get<half>();
         auto delta=dB.template Get<float>(); auto out=oB.template Get<float>(); auto oh=ohB.template Get<half>();
@@ -391,14 +400,16 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         auto sumA=sumAB.template Get<float>(); auto sumB=sumBB.template Get<float>();
         auto masks=maskB.template Get<uint32_t>();
         auto row_blocks=rowMaxBlockB.template Get<float>();
-        if (group<tasks) {
-            constexpr uint32_t MaskWords=G::CausalMaskBytes/sizeof(uint32_t);
-            AscendC::GlobalTensor<uint32_t> masks_gm;
-            masks_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(causal_masks)+sub*MaskWords,MaskWords);
-            // Load each alignment once while the Cube starts the first QK.
-            AscendC::DataCopy(masks,masks_gm,MaskWords);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
+        AscendC::GlobalTensor<uint32_t> masks_gm;
+        masks_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(causal_masks)+sub*G::CausalMaskGmWords,
+            G::CausalMaskGmWords);
+        if constexpr(!G::MaskPerQuery) {
+            if (group<tasks) {
+                // Load every alignment once while the Cube starts the first QK.
+                AscendC::DataCopy(masks,masks_gm,G::CausalMaskUbWords);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
+            }
         }
         for(QueryAssignment<BalanceQueries> assignment{groups,group};assignment.Task()<tasks;assignment.Advance()) {
             const uint32_t task=static_cast<uint32_t>(assignment.Task());
@@ -412,9 +423,17 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             const uint32_t score_row_offset=sub*ScoreElements;
             Sync<AscendC::HardEvent::V_MTE2>(pipe);
             const uint32_t mask_offset=((qs%BN)/BM)*G::CausalMaskWords;
+            auto diagonal_mask=masks;
+            if constexpr(G::MaskPerQuery) {
+                AscendC::DataCopy(masks,masks_gm[mask_offset],G::CausalMaskUbWords);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
+            } else {
+                diagonal_mask=masks[mask_offset];
+            }
             const uint32_t diagonal_kv=TrimDiagonal ? qs%BN+BM : BN;
             PrepareTile<R,BN,true,TrimDiagonal>(sgm[score_row_offset],pgm,score_ub,p,oh,partial0,partial1,
-                m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,masks[mask_offset],0,0,sub,pipe,diagonal_kv);
+                m,l,alpha,maxA,maxB,sumA,sumB,row_blocks,diagonal_mask,0,0,sub,pipe,diagonal_kv);
             uint32_t prepared=1;
             for(uint32_t tile=0;tile<kv_tiles;++tile) {
                 const uint32_t pv_slot=tile%PvRelaySlots;
@@ -433,7 +452,7 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
                     const uint32_t next_slot=prepared%PvRelaySlots;
                     auto next_s=score_ub;
                     auto next_p=p;
-                    if constexpr(BN!=512) {
+                    if constexpr(!G::Stacked) {
                         next_s=score_ub[(prepared%UbScoreSlots)*ScoreElements];
                         next_p=next_slot==PvRelaySlots-1 ? oh : p[next_slot*ScoreElements];
                     }

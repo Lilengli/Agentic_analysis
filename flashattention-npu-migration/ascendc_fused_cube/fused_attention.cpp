@@ -39,21 +39,24 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     TORCH_CHECK(q.scalar_type()==at::kHalf && k.scalar_type()==at::kHalf && v.scalar_type()==at::kHalf,"FP16 required");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),"contiguous tensors required");
     TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(),"forward inference only");
+    const bool wide_stack=bm==128 && bn==1024;
+    const bool stacked=(bm==128 && bn==512) || wide_stack;
     TORCH_CHECK(((bm==32 || bm==64 || bm==128) && (bn==64 || bn==128) && bm<=bn) ||
-        (bm==128 && bn==512),"BM32/64/128 BN64/128 with BM<=BN, or experimental BM128/BN512 required");
-    const bool stack512=bm==128 && bn==512;
+        stacked,"BM32/64/128 BN64/128 with BM<=BN, or BM128 with BN512/1024 required");
     // With diagonal trimming, every KV slice ends at or before the query block.
-    const int64_t seq_alignment=stack512 && trim_diagonal ? bm : bn;
-    const int64_t max_seq=stack512 && trim_diagonal ? (1<<20) : (1<<14);
+    const int64_t seq_alignment=stacked && trim_diagonal ? bm : bn;
+    const int64_t max_seq=stacked && trim_diagonal ? (1<<20) : (1<<14);
     TORCH_CHECK(q.size(0)>0 && q.size(1)>0 && q.size(2)>0 && q.size(2)<=max_seq &&
         q.size(2)%seq_alignment==0 && q.size(3)==128,
         "S<=",max_seq," divisible by ",seq_alignment," and D128 required");
-    const bool prefetch_v=prefetch_pv_v.value_or(stack512);
-    TORCH_CHECK(!prefetch_v || stack512,"prefetch_pv_v requires BM128/BN512");
-    TORCH_CHECK(!cross_query || prefetch_v,"cross_query requires BM128/BN512 with V prefetch");
+    const bool prefetch_v=prefetch_pv_v.value_or(stacked);
+    TORCH_CHECK(!prefetch_v || stacked,"prefetch_pv_v requires BM128 with BN512/1024");
+    TORCH_CHECK(!cross_query || prefetch_v,"cross_query requires BM128 with BN512/1024 and V prefetch");
     TORCH_CHECK(!trim_diagonal || cross_query,"trim_diagonal requires cross_query");
     TORCH_CHECK(!vector_normalize || trim_diagonal,"vector_normalize requires trim_diagonal");
     TORCH_CHECK(!balance_queries || trim_diagonal,"balance_queries requires trim_diagonal");
+    TORCH_CHECK(!wide_stack || (balance_queries && !vector_normalize),
+        "BN1024 requires balanced queries and per-row output normalization");
     TORCH_CHECK(groups>0 && groups<=24,"groups must be 1..24");
     const int64_t heads=q.size(0)*q.size(1);
     TORCH_CHECK(heads<=std::numeric_limits<uint32_t>::max()/(q.size(2)/bm),"too many tasks");
@@ -78,6 +81,8 @@ at::Tensor forward(const at::Tensor& q,const at::Tensor& k,const at::Tensor& v,
     else if(bm==64 && bn==64) CubeFA::fused_cube_attention<64,64><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==64 && bn==128) CubeFA::fused_cube_attention<64,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(bm==128 && bn==128) CubeFA::fused_cube_attention<128,128><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
+    else if(wide_stack)
+        CubeFA::fused_cube_attention<128,1024,true,true,true,false,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(balance_queries && vector_normalize)
         CubeFA::fused_cube_attention<128,512,true,true,true,true,true><<<groups,nullptr,stream>>>(sync_base,qp,kp,vp,op,wp,mp,heads,seq,groups);
     else if(balance_queries)
@@ -125,6 +130,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["gm_relay_bytes_per_group_bm64_bn128"]=CubeFA::Geometry<64,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn128"]=CubeFA::Geometry<128,128>::RelayBytes;
         d["gm_relay_bytes_per_group_bm128_bn512"]=CubeFA::Geometry<128,512>::RelayBytes;
+        d["gm_relay_bytes_per_group_bm128_bn1024"]=CubeFA::Geometry<128,1024>::RelayBytes;
         d["gm_intermediates"]="FP32 score ring, three FP16 probability slots and three FP32 PV slots per group";
         d["gm_score_slots"]=CubeFA::ScoreSlots;
         d["gm_pv_slots"]=CubeFA::PvRelaySlots;
@@ -139,6 +145,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         d["stack512_vector_batch_rows"]=CubeFA::Geometry<128,512>::BatchRows;
         d["stack512_default_prefetch_pv_v"]=true;
         d["stack512_cube_kv_per_mmad"]=CubeFA::Geometry<128,512>::CubeKv;
+        d["stack1024_vector_batch_rows"]=CubeFA::Geometry<128,1024>::BatchRows;
+        d["stack1024_cube_kv_per_mmad"]=CubeFA::Geometry<128,1024>::CubeKv;
         d["output_rescale"]="broadcast alpha and multiply before PV_READY";
         d["softmax_lookahead_tiles"]=CubeFA::PvRelaySlots-1;
         d["online_state"]="FP32 max, denominator and accumulated output in AIV UB";

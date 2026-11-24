@@ -41,22 +41,25 @@ inline void PackCausalMasks(uint32_t* masks, uint32_t bm, uint32_t bn)
 
 template<uint32_t BM,uint32_t BN> struct Geometry {
     static_assert(((BM==32 || BM==64 || BM==128) && (BN==64 || BN==128) && BM<=BN)
-        || (BM==128 && BN==512));
+        || (BM==128 && (BN==512 || BN==1024)));
+    static constexpr bool Stacked=BN>128;
     static constexpr uint32_t Rows=BM/2;
-    static constexpr uint32_t CubeKv=BN==512 ? 128 : BN;
-    static constexpr uint32_t BatchRows=BN==512 ? 16 : Rows;
+    static constexpr uint32_t CubeKv=Stacked ? 128 : BN;
+    static constexpr uint32_t BatchRows=Stacked ? 8192/BN : Rows;
     static constexpr uint32_t BatchElements=BatchRows*BN;
-    static constexpr uint32_t PBufferSlots=BN==512 ? 1 : PvRelaySlots-1;
+    static constexpr uint32_t PBufferSlots=Stacked ? 1 : PvRelaySlots-1;
     static constexpr uint32_t SBytes=BM*BN*4;
     static constexpr uint32_t PBytes=BM*BN*2;
     static constexpr uint32_t DeltaBytes=BM*D*4;
     static constexpr uint32_t SecondScoreOffset=SBytes+PvRelaySlots*(PBytes+DeltaBytes);
     static constexpr uint32_t RelayBytes=RelayBytesFor(BM,BN);
     static constexpr uint32_t CausalMaskWords=Rows*BN/32;
-    static constexpr uint32_t CausalMaskBytes=MaskWordsPerAiv(BN)*sizeof(uint32_t);
+    static constexpr bool MaskPerQuery=BN==1024;
+    static constexpr uint32_t CausalMaskGmWords=MaskWordsPerAiv(BN);
+    static constexpr uint32_t CausalMaskUbWords=MaskPerQuery ? CausalMaskWords : CausalMaskGmWords;
     static constexpr uint32_t BroadcastBytes=Rows*32;
     static constexpr uint32_t UbBytes=UbScoreSlots*BatchElements*4+PBufferSlots*BatchElements*2
-        +2*Rows*D*4+Rows*D*2+(6+PvRelaySlots)*Rows*4+CausalMaskBytes+BroadcastBytes;
+        +2*Rows*D*4+Rows*D*2+(6+PvRelaySlots)*Rows*4+CausalMaskUbWords*sizeof(uint32_t)+BroadcastBytes;
 };
 // Ordered QK notifications alternate two counters independently of the GM ring.
 constexpr uint16_t QK_READY=0, P_READY=1, PV_READY=2, TILE_DONE=3, QK_ODD_READY=4;

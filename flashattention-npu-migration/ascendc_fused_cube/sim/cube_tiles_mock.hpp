@@ -519,6 +519,16 @@ inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTenso
     RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs - rhs; });
     CubeFASim::CountVector(&CubeFASim::Stats::sub_calls);
 }
+inline void Max(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return std::max(lhs, rhs); });
+    CubeFASim::CountVector(&CubeFASim::Stats::max_calls);
+}
+inline void Add(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b,
+        uint64_t mask, uint8_t repeats, const BinaryRepeatParams& params) {
+    RepeatBinary(destination, a, b, mask, repeats, params, [](float lhs, float rhs) { return lhs + rhs; });
+    CubeFASim::CountVector(&CubeFASim::Stats::add_calls);
+}
 inline void Sub(LocalTensor<float> destination, LocalTensor<float> a, LocalTensor<float> b, size_t n) {
     if (n > destination.length || n > a.length || n > b.length)
         throw std::runtime_error("mixed simulator: Sub out of bounds");

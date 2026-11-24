@@ -65,17 +65,20 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
     constexpr uint32_t MaxK = G::CubeKv > CubeFA::D ? G::CubeKv : CubeFA::D;
     constexpr uint32_t MaxN = MaxK;
     constexpr uint64_t batches = R / G::BatchRows;
-    constexpr uint64_t reductions_per_tile = batches * (BN == 512 ? 3 : (BN / 64) * 2);
+    constexpr uint64_t reductions_per_tile = batches * (G::Stacked ? 3 : (BN / 64) * 2);
     const uint64_t tasks = query_tasks.size();
     const uint64_t iterations = kv_prefix.size() - 1;
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending{};
     std::array<uint64_t, CubeFA::ScoreSlots + 1> expected_pending_before_done{};
     std::vector<uint64_t> expected_prepared_at_pv_wait;
+    std::vector<uint64_t> expected_masks_at_pv_wait;
     const uint32_t query_tiles = seq / BM;
     uint64_t prepared = 0, trimmed_tasks=0;
     const uint64_t kv_total=kv_prefix.back();
     std::array<bool, CubeFA::PvRelaySlots> pending_pv{};
+    uint64_t mask_reads = G::MaskPerQuery || !tasks ? 0 : G::CausalMaskUbWords;
     for (uint32_t task : query_tasks) {
+        if constexpr(G::MaskPerQuery) mask_reads += G::CausalMaskUbWords;
         const uint32_t qs=(task%query_tiles)*BM;
         const uint32_t kv_tiles=qs/BN+1;
         if constexpr(TrimDiagonal) trimmed_tasks+=qs%BN+BM<BN;
@@ -93,9 +96,11 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
                 ++expected_pending_before_done[std::min(kv_tiles-tile,CubeFA::ScoreSlots)];
             expected_pending_before_done[0] += std::min(kv_tiles,CubeFA::PvRelaySlots);
         }
-        for (uint32_t tile = 0; tile < kv_tiles; ++tile)
+        for (uint32_t tile = 0; tile < kv_tiles; ++tile) {
             expected_prepared_at_pv_wait.push_back(
                 prepared + std::min(tile + CubeFA::PvRelaySlots, kv_tiles));
+            expected_masks_at_pv_wait.push_back(mask_reads);
+        }
         prepared += kv_tiles;
     }
     if constexpr(CrossQuery) {
@@ -132,8 +137,7 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
 
     for (const CubeFASim::Stats* av : {&av0, &av1}) {
         constexpr uint64_t mul_calls_per_tile = batches + CubeFA::D / 64;
-        const uint64_t mask_reads = tasks ? CubeFA::MaskWordsPerAiv(BN) : 0;
-        Require(av->reads_before_first_qk == mask_reads,
+        Require(av->reads_before_first_qk == (tasks ? G::CausalMaskUbWords : 0),
             "AIV must load its packed mask before the first QK wait");
         Require(av->local_bytes_by_position[unsigned(AscendC::TPosition::VECCALC)] == G::UbBytes,
             "AIV UB buffers exceed or differ from Geometry::UbBytes");
@@ -144,7 +148,8 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
             const auto& snapshot = av->pv_waits[i];
             Require(snapshot.p_ready_calls == scores_prepared,
                 "AIV must publish its full probability lookahead before waiting for the current PV");
-            Require(snapshot.gm_read_elements == mask_reads + (kv_prefix[scores_prepared] + i * CubeFA::D) * R,
+            Require(snapshot.gm_read_elements == expected_masks_at_pv_wait[i] +
+                    (kv_prefix[scores_prepared] + i * CubeFA::D) * R,
                 "AIV did not prefetch the next score before waiting for PV");
             Require(snapshot.block_reduce_max_calls == scores_prepared * reductions_per_tile,
                 "AIV did not reduce the next score before waiting for PV");
@@ -161,7 +166,7 @@ void CheckStats(uint32_t group, const std::vector<uint32_t>& query_tasks, uint32
         const uint64_t reduce_calls = iterations * reductions_per_tile;
         Require(av->block_reduce_max_calls == reduce_calls && av->block_reduce_sum_calls == reduce_calls,
             "AIV reduction calls do not match the score tile width");
-        Require(av->max_calls == iterations * batches * (BN == 128 ? 2 : 1),
+        Require(av->max_calls == iterations * batches * (BN == 128 || BN == 1024 ? 2 : 1),
             "AIV must update the running maxima as vectors");
         Require(av->brcb_calls == (batches + 1) * iterations + (VectorNormalize ? tasks : 0) &&
                     av->sub_calls == iterations * batches * (1 + BN / 64),
@@ -354,6 +359,11 @@ void CheckBalancedQueries() {
     Check<128, 512, true, true, true, false, true>(1536, 1, 10, 0);
     Check<128, 512, true, true, true, true, true>(1024, 2, 3, 0);
 }
+
+void CheckWideStack() {
+    Check<128, 1024, true, true, true, false, true>(1152, 2, 5, 0);
+    Check<128, 1024, true, true, true, false, true>(4224, 1, 4, 1);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -391,7 +401,12 @@ int main(int argc, char** argv) {
             CheckBalancedQueries();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--wide-stack") {
+            CheckWideStack();
+            return 0;
+        }
         CheckBalancedQueries();
+        CheckWideStack();
         CheckShape<32, 64>();
         CheckShape<32, 128>();
         CheckShape<64, 64>();

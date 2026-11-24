@@ -1,4 +1,4 @@
-"""Benchmark the balanced BN512 or handwritten kernel against CANN FlashAttentionScore."""
+"""Benchmark generated or handwritten kernels against CANN FlashAttentionScore."""
 import argparse
 import json
 import math
@@ -63,7 +63,7 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
     candidate = 'handwritten' if handwritten else 'generated'
     blocks = None if handwritten else min(args.max_blocks, BATCH * HEADS * (seq // GENERATED['block_m']))
     configuration = 'handwritten BSND' if handwritten else f'blocks={blocks}'
-    print(f'S={seq} {configuration}  verifying both kernels', flush=True)
+    print(f'S={seq} {configuration}  verifying outputs', flush=True)
     torch.manual_seed(args.seed)
     cpu_qkv = [torch.randn(shape, dtype=torch.float16) for _ in range(3)]
     indices = torch.linspace(0, seq - 1, min(args.rows, seq)).round().long().unique()
@@ -75,10 +75,10 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
     torch.npu.synchronize()
     del cpu_qkv
 
-    def run_candidate():
+    def run_candidate(block_n=GENERATED['block_n']):
         if handwritten:
             return flash_attn_func(qb, kb, vb, dropout_p=0.0, softmax_scale=SCALE, causal=True)
-        return fused_cube_ext.forward(q, k, v, blocks=blocks, **GENERATED)
+        return fused_cube_ext.forward(q, k, v, blocks=blocks, **{**GENERATED, 'block_n': block_n})
 
     def cann():
         return torch_npu.npu_fusion_attention(
@@ -91,7 +91,10 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
             output = output.transpose(1, 2)
         return check_output(torch, output, shape, device_indices, reference, f'S={seq} {name} {stage}')
 
-    methods = {candidate: run_candidate, 'cann': cann}
+    methods = {candidate: run_candidate}
+    if args.compare_stack_widths:
+        methods['generated_bn1024'] = lambda: run_candidate(1024)
+    methods['cann'] = cann
     stats = {}
     for name, call in methods.items():
         stats[name] = {
@@ -105,8 +108,10 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
             outputs[name] = call()
     torch.npu.synchronize()
 
+    names = tuple(methods)
     for index in range(args.repeat):
-        order = methods if index % 2 == 0 else reversed(methods)
+        first = index % len(names)
+        order = names[first:] + names[:first]
         for name in order:
             start = torch.npu.Event(enable_timing=True)
             stop = torch.npu.Event(enable_timing=True)
@@ -132,6 +137,9 @@ def benchmark_sequence(torch, torch_npu, fused_cube_ext, mask, device, seq, args
     }
     if not handwritten:
         row['generated_blocks'] = blocks
+    if args.compare_stack_widths:
+        row['bn1024_speedup_vs_bn512'] = (
+            stats['generated']['event_median_us'] / stats['generated_bn1024']['event_median_us'])
     return row
 
 
@@ -154,7 +162,10 @@ def main():
                         help='sequence lengths, default 256 through 16384')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--max-blocks', type=int, choices=range(1, 25), default=24)
-    parser.add_argument('--handwritten-source', type=Path, help='compare a flash-attention-npu source checkout')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--handwritten-source', type=Path, help='compare a flash-attention-npu source checkout')
+    mode.add_argument('--compare-stack-widths', action='store_true',
+                      help='benchmark generated BN512 and BN1024 on the same inputs as CANN')
     parser.add_argument('--rows', type=int, default=64)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--warmup', type=int, default=5)
@@ -162,7 +173,10 @@ def main():
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.output is None:
-        filename = 'handwritten_vs_cann_256_to_16k.json' if args.handwritten_source else 'flash_attention_256_to_16k.json'
+        if args.compare_stack_widths:
+            filename = 'flash_attention_stack_widths.json'
+        else:
+            filename = 'handwritten_vs_cann_256_to_16k.json' if args.handwritten_source else 'flash_attention_256_to_16k.json'
         args.output = Path(filename)
     if args.rows < 1 or args.repeat < 1 or args.warmup < 0 or args.device < 0:
         parser.error('rows and repeat must be positive; warmup and device must be nonnegative')
@@ -207,6 +221,8 @@ def main():
             'generated_config': GENERATED, 'generated_max_blocks': args.max_blocks,
             'candidate_input_layout': 'BNSD',
         }
+        if args.compare_stack_widths:
+            implementation['generated_bn1024_config'] = {**GENERATED, 'block_n': 1024}
     report = {
         'device': torch.npu.get_device_name(args.device),
         'torch': str(torch.__version__), 'torch_npu': str(torch_npu.__version__),
@@ -230,6 +246,11 @@ def main():
             print(f"S={seq:5}  {candidate}={item['event_median_us']:9.2f} us  "
                   f"CANN={official['event_median_us']:9.2f} us  "
                   f"CANN/{candidate}={row[f'{candidate}_speedup_vs_cann']:.3f}x", flush=True)
+            if args.compare_stack_widths:
+                wide = row['methods']['generated_bn1024']['event_median_us']
+                print(f"S={seq:5}  BN512={item['event_median_us']:9.2f} us  "
+                      f"BN1024={wide:9.2f} us  BN512/BN1024={row['bn1024_speedup_vs_bn512']:.3f}x",
+                      flush=True)
     print(f'Saved {args.output}', flush=True)
 
 

@@ -31,11 +31,11 @@ def main():
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--heads', type=int, default=2)
     p.add_argument('--block-m', type=int, choices=(32, 64, 128), default=64)
-    p.add_argument('--block-n', type=int, choices=(64, 128, 512), default=128)
+    p.add_argument('--block-n', type=int, choices=(64, 128, 512, 1024), default=128)
     p.add_argument('--blocks', type=int, default=24, help='AIC groups; each has two AIV')
     pv = p.add_mutually_exclusive_group()
     pv.add_argument('--prefetch-pv-v', dest='prefetch_pv_v', action='store_true', default=None,
-                    help='prefetch V before P_READY (default for BM128/BN512)')
+                    help='prefetch V before P_READY (default for BM128 with BN512/1024)')
     pv.add_argument('--no-prefetch-pv-v', dest='prefetch_pv_v', action='store_false',
                     help='use the previous PV load order for comparison')
     p.add_argument('--cross-query', action='store_true',
@@ -55,27 +55,29 @@ def main():
     p.add_argument('--profile-metrics', choices=('pipe', 'memory-access'), default='pipe')
     p.add_argument('--output', default='fused_cube_16k.json')
     a = p.parse_args()
-    stack512 = (a.block_m, a.block_n) == (128, 512)
+    stacked = a.block_m == 128 and a.block_n in (512, 1024)
     supported_tile = ((a.block_m in (32, 64, 128) and a.block_n in (64, 128)
                        and a.block_m <= a.block_n)
-                      or stack512)
-    seq_alignment = a.block_m if stack512 and a.trim_diagonal else a.block_n
+                      or stacked)
+    seq_alignment = a.block_m if stacked and a.trim_diagonal else a.block_n
     if not (0 < a.seq <= 16384 and a.seq % seq_alignment == 0 and 0 < a.blocks <= 24
             and supported_tile and min(a.rows, a.batch, a.heads, a.repeat) > 0 and a.warmup >= 0):
         p.error('invalid shape/count: supported tiles are BM32/64/128 with BN64/128 and BM<=BN, '
-                f'or experimental BM128/BN512; S must be divisible by {seq_alignment}, '
+                f'or BM128 with BN512/1024; S must be divisible by {seq_alignment}, '
                 'groups 1..24, counts positive')
-    prefetch_v = stack512 if a.prefetch_pv_v is None else a.prefetch_pv_v
-    if prefetch_v and not stack512:
-        p.error('--prefetch-pv-v requires --block-m 128 --block-n 512')
+    prefetch_v = stacked if a.prefetch_pv_v is None else a.prefetch_pv_v
+    if prefetch_v and not stacked:
+        p.error('--prefetch-pv-v requires BM128 with BN512/1024')
     if a.cross_query and not prefetch_v:
-        p.error('--cross-query requires BM128/BN512 with V prefetch')
+        p.error('--cross-query requires BM128 with BN512/1024 and V prefetch')
     if a.trim_diagonal and not a.cross_query:
         p.error('--trim-diagonal requires --cross-query')
     if a.vector_normalize and not a.trim_diagonal:
         p.error('--vector-normalize requires --trim-diagonal')
     if a.balance_queries and not a.trim_diagonal:
         p.error('--balance-queries requires --trim-diagonal')
+    if a.block_n == 1024 and (not a.balance_queries or a.vector_normalize):
+        p.error('--block-n 1024 requires --balance-queries and per-row output normalization')
     if a.profile:
         profile_dir = Path(a.profile).resolve()
         if profile_dir.exists() and any(profile_dir.iterdir()):
