@@ -45,6 +45,7 @@ def cpu_gating_topk(torch, logits, bias, topk, n_group, k_group, routed_scaling_
 
 def build_inputs(
     torch,
+    device,
     num_tokens,
     num_experts,
     topk,
@@ -61,64 +62,75 @@ def build_inputs(
     import torch.nn.functional as F
 
     rng = torch.Generator().manual_seed(seed)
-    # Scale std by 1/sqrt(dim) so BF16 outputs stay well within numerical tolerance.
-    x = torch.randn(num_tokens, hidden_size, generator=rng, dtype=dtype) * (1.0 / math.sqrt(hidden_size))
-    w13 = (
-        torch.randn(num_experts, hidden_size, 2 * intermediate_size, generator=rng, dtype=dtype)
-        * (1.0 / math.sqrt(hidden_size))
-    )
-    w2 = (
-        torch.randn(num_experts, intermediate_size, hidden_size, generator=rng, dtype=dtype)
-        * (1.0 / math.sqrt(intermediate_size))
-    )
+    x_cpu = torch.randn(num_tokens, hidden_size, generator=rng, dtype=dtype)
+    x_cpu.mul_(1.0 / math.sqrt(hidden_size))
 
     if include_gating:
-        logits = torch.randn(num_tokens, num_experts, generator=rng, dtype=dtype)
-        bias = torch.randn(num_experts, generator=rng, dtype=dtype) * 0.1
+        logits_cpu = torch.randn(num_tokens, num_experts, generator=rng, dtype=dtype)
+        bias_cpu = torch.randn(num_experts, generator=rng, dtype=dtype)
+        bias_cpu.mul_(0.1)
         topk_weights_f32, topk_ids_i64 = cpu_gating_topk(
-            torch, logits, bias, topk, n_group, k_group, routed_scaling_factor
+            torch, logits_cpu, bias_cpu, topk, n_group, k_group, routed_scaling_factor
         )
-        topk_ids = topk_ids_i64.to(torch.int32)
-        topk_weights = topk_weights_f32.to(dtype)
+        topk_ids_cpu = topk_ids_i64.to(torch.int32)
+        topk_weights_cpu = topk_weights_f32.to(dtype)
     else:
-        logits = None
-        bias = None
+        logits_cpu = None
+        bias_cpu = None
         selected = [torch.randperm(num_experts, generator=rng)[:topk] for _ in range(num_tokens)]
-        topk_ids = torch.stack(selected, dim=0).to(torch.int32)
+        topk_ids_cpu = torch.stack(selected, dim=0).to(torch.int32)
         raw_weights = torch.rand(num_tokens, topk, generator=rng, dtype=torch.float32) + 0.1
-        topk_weights = (raw_weights / raw_weights.sum(dim=-1, keepdim=True) * routed_scaling_factor).to(dtype)
+        topk_weights_cpu = (raw_weights / raw_weights.sum(dim=-1, keepdim=True) * routed_scaling_factor).to(dtype)
 
     if include_shared:
-        shared_w13 = (
-            torch.randn(hidden_size, 2 * intermediate_size, generator=rng, dtype=dtype)
-            * (1.0 / math.sqrt(hidden_size))
-        )
-        shared_w2 = (
-            torch.randn(intermediate_size, hidden_size, generator=rng, dtype=dtype)
-            * (1.0 / math.sqrt(intermediate_size))
-        )
+        shared_w13_cpu = torch.randn(hidden_size, 2 * intermediate_size, generator=rng, dtype=dtype)
+        shared_w13_cpu.mul_(1.0 / math.sqrt(hidden_size))
+        shared_w2_cpu = torch.randn(intermediate_size, hidden_size, generator=rng, dtype=dtype)
+        shared_w2_cpu.mul_(1.0 / math.sqrt(intermediate_size))
     else:
-        shared_w13 = None
-        shared_w2 = None
+        shared_w13_cpu = None
+        shared_w2_cpu = None
 
-    # CPU FP32 reference
-    x_f32 = x.float()
-    w13_f32 = w13.float()
-    w2_f32 = w2.float()
-    tw_f32 = topk_weights.float()
+    # Allocate large expert weights directly on device to avoid huge CPU RNG & RAM overhead.
+    if device.type == 'npu':
+        torch.npu.manual_seed(seed)
+    else:
+        torch.manual_seed(seed)
+    w13 = torch.randn(num_experts, hidden_size, 2 * intermediate_size, device=device, dtype=dtype)
+    w13.mul_(1.0 / math.sqrt(hidden_size))
+    w2 = torch.randn(num_experts, intermediate_size, hidden_size, device=device, dtype=dtype)
+    w2.mul_(1.0 / math.sqrt(intermediate_size))
+
+    # CPU FP32 reference: only copy weights of experts actually selected by topk_ids.
+    x_f32 = x_cpu.float()
+    tw_f32 = topk_weights_cpu.float()
     ref = torch.zeros_like(x_f32)
+    expert_to_tokens = {}
     for t in range(num_tokens):
         for k_idx in range(topk):
-            e = int(topk_ids[t, k_idx].item())
-            gate_up = x_f32[t] @ w13_f32[e]
+            e = int(topk_ids_cpu[t, k_idx].item())
+            expert_to_tokens.setdefault(e, []).append((t, k_idx))
+    for e, pairs in expert_to_tokens.items():
+        w13_e = w13[e].cpu().float()
+        w2_e = w2[e].cpu().float()
+        for t, k_idx in pairs:
+            gate_up = x_f32[t] @ w13_e
             gate, up = gate_up.chunk(2, dim=-1)
             act = F.silu(gate) * up
-            ref[t] += tw_f32[t, k_idx] * (act @ w2_f32[e])
+            ref[t] += tw_f32[t, k_idx] * (act @ w2_e)
 
     if include_shared:
-        s_gate_up = x_f32 @ shared_w13.float()
+        s_gate_up = x_f32 @ shared_w13_cpu.float()
         s_gate, s_up = s_gate_up.chunk(2, dim=-1)
-        ref = ref + (F.silu(s_gate) * s_up) @ shared_w2.float()
+        ref = ref + (F.silu(s_gate) * s_up) @ shared_w2_cpu.float()
+
+    x = x_cpu.to(device)
+    topk_ids = topk_ids_cpu.to(device)
+    topk_weights = topk_weights_cpu.to(device)
+    logits = logits_cpu.to(device) if logits_cpu is not None else None
+    bias = bias_cpu.to(device) if bias_cpu is not None else None
+    shared_w13 = shared_w13_cpu.to(device) if shared_w13_cpu is not None else None
+    shared_w2 = shared_w2_cpu.to(device) if shared_w2_cpu is not None else None
 
     return x, w13, w2, topk_ids, topk_weights, logits, bias, shared_w13, shared_w2, ref
 
@@ -209,34 +221,6 @@ def main():
     torch.npu.set_device(device)
     dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16
 
-    x, w13, w2, topk_ids, topk_weights, logits, bias, shared_w13, shared_w2, reference = build_inputs(
-        torch,
-        args.num_tokens,
-        args.num_experts,
-        args.topk,
-        args.hidden_size,
-        args.intermediate_size,
-        dtype,
-        args.seed,
-        args.include_gating,
-        args.include_shared,
-        args.n_group,
-        args.k_group,
-        args.routed_scaling_factor,
-    )
-
-    x = x.to(device)
-    w13 = w13.to(device)
-    w2 = w2.to(device)
-    topk_ids = topk_ids.to(device)
-    topk_weights = topk_weights.to(device)
-    if logits is not None:
-        logits = logits.to(device)
-        bias = bias.to(device)
-    if shared_w13 is not None:
-        shared_w13 = shared_w13.to(device)
-        shared_w2 = shared_w2.to(device)
-
     report = {
         'device': torch.npu.get_device_name(device),
         'torch': str(torch.__version__),
@@ -259,6 +243,24 @@ def main():
         'results': {},
     }
     print(f"device={report['device']} shape={report['shape']}", flush=True)
+    print('[init] allocating weights on NPU and computing CPU FP32 reference...', flush=True)
+
+    x, w13, w2, topk_ids, topk_weights, logits, bias, shared_w13, shared_w2, reference = build_inputs(
+        torch,
+        device,
+        args.num_tokens,
+        args.num_experts,
+        args.topk,
+        args.hidden_size,
+        args.intermediate_size,
+        dtype,
+        args.seed,
+        args.include_gating,
+        args.include_shared,
+        args.n_group,
+        args.k_group,
+        args.routed_scaling_factor,
+    )
 
     active_num = args.num_tokens * args.topk
     row_idx_type = 1 if args.combine_op == 'unpermute' else 0
