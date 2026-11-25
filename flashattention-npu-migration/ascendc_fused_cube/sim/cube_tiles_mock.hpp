@@ -74,7 +74,7 @@ constexpr int PIPE_MTE3 = 2;
 constexpr int PIPE_FIX = 3;
 
 namespace CubeFASim {
-constexpr unsigned kFlagCount = 4;
+constexpr unsigned kFlagCount = 5;
 constexpr unsigned kAivCount = 2;
 constexpr std::chrono::seconds kWaitTimeout{5};
 
@@ -229,15 +229,29 @@ enum { AIC = 0, AIV = 1 };
 enum class TPosition { A1 = 0, A2 = 1, B2 = 2, CO1 = 3, VECCALC = 4 };
 enum class RoundMode { CAST_NONE, CAST_RINT };
 enum class ReduceOrder { ORDER_ONLY_VALUE };
-enum class HardEvent { V_MTE2, MTE2_V, V_S, S_V, V_MTE3, MTE3_V };
+enum class HardEvent { V_MTE2, MTE2_V, V_S, S_V, V_MTE3, MTE3_V, FIX_M };
 
 inline uint32_t GetBlockIdx() { return CubeFASim::context.group * 3; }
 inline uint32_t GetBlockNum() { return uint32_t(CubeFASim::groups.size()) * 3; }
 inline uint32_t GetSubBlockNum() { return 3; }
 inline uint32_t GetSubBlockIdx() { return CubeFASim::context.sub; }
 
-template <HardEvent> void SetFlag(int) {}
-template <HardEvent> void WaitFlag(int) {}
+inline thread_local bool l0c_slot_ready[2]{};
+
+template <HardEvent E> void SetFlag(int id) {
+    if constexpr (E == HardEvent::FIX_M) {
+        if (id < 0 || id >= 2 || l0c_slot_ready[id])
+            throw std::runtime_error("mixed simulator: invalid L0C slot release");
+        l0c_slot_ready[id] = true;
+    }
+}
+template <HardEvent E> void WaitFlag(int id) {
+    if constexpr (E == HardEvent::FIX_M) {
+        if (id < 0 || id >= 2 || !l0c_slot_ready[id])
+            throw std::runtime_error("mixed simulator: L0C slot has no release");
+        l0c_slot_ready[id] = false;
+    }
+}
 template <int> void PipeBarrier() {}
 template <int Mode, int Pipe> void CrossCoreSetFlag(uint32_t flag) { CubeFASim::SetFlag(flag); }
 inline void CrossCoreWaitFlag(uint32_t flag) { CubeFASim::WaitFlag(flag); }
@@ -316,6 +330,20 @@ template <class A, class B> void Cast(LocalTensor<A> destination, LocalTensor<B>
 template <class T> void Duplicate(LocalTensor<T> destination, T value, size_t n) {
     if (n > destination.length) throw std::runtime_error("mixed simulator: Duplicate out of bounds");
     for (size_t i = 0; i < n; ++i) destination.SetValue(i, value);
+    CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
+}
+inline void Duplicate(LocalTensor<float> destination, float value, const uint64_t mask[],
+        uint8_t repeats, uint16_t block_stride, uint8_t repeat_stride) {
+    constexpr size_t block_elements = 32 / sizeof(float);
+    if (destination.offset % 32 || !mask[0] || mask[1] || !repeats)
+        throw std::runtime_error("mixed simulator: invalid masked FP32 Duplicate");
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        for (size_t lane = 0; lane < 64; ++lane) {
+            if (!(mask[0] & (uint64_t{1} << lane))) continue;
+            const size_t block = repeat * repeat_stride + lane / block_elements * block_stride;
+            destination.SetValue(block * block_elements + lane % block_elements, value);
+        }
+    }
     CubeFASim::CountVector(&CubeFASim::Stats::duplicate_calls);
 }
 
@@ -404,13 +432,19 @@ __aicore__ inline void Sync(AscendC::TPipe& pipe) {
     AscendC::WaitFlag<E>(id);
 }
 
-template<class ALayout, class BLayout>
+template<bool DoubleBufferedL0C=false, class ALayout, class BLayout>
 __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         AscendC::GlobalTensor<half> b, AscendC::GlobalTensor<float> c,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
         AscendC::LocalTensor<half>, AscendC::LocalTensor<half>,
-        AscendC::LocalTensor<float>, uint32_t m, uint32_t n, uint32_t k,
-        ALayout a_layout, BLayout b_layout, bool = true) {
+        AscendC::LocalTensor<float> l0c, uint32_t m, uint32_t n, uint32_t k,
+        ALayout a_layout, BLayout b_layout, bool = true, int32_t l0c_slot = 0) {
+    if constexpr (DoubleBufferedL0C) {
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+        const size_t slot_bytes = l0c.owner->size() / 2;
+        if (l0c.offset != size_t(l0c_slot) * slot_bytes || size_t(m) * n * sizeof(float) > slot_bytes)
+            throw std::runtime_error("mixed simulator: L0C tensor does not match its slot");
+    }
     if (a_layout.rows != m || a_layout.cols != k || b_layout.rows != k || b_layout.cols != n)
         throw std::runtime_error("mixed simulator: GEMM layout does not match its dimensions");
     if (a.offset % 32 || b.offset % 32 || c.offset % 32 ||
@@ -431,5 +465,8 @@ __aicore__ inline void Gemm(AscendC::TPipe&, AscendC::GlobalTensor<half> a,
         }
     }
     CubeFASim::CountMmad();
+    if constexpr (DoubleBufferedL0C) {
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0c_slot);
+    }
 }
 } // namespace CubeFA

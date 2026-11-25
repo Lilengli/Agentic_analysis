@@ -6,8 +6,10 @@ import fused_cube_ext
 
 def run_checks():
     with torch.inference_mode():
-        for bm in (32,64):
+        for bm in (32,64,128):
             for bn in (64,128):
+                if bm > bn:
+                    continue
                 for transpose in (True,False):
                     k,n=(128,bn) if transpose else (bn,128)
                     for seed in (0,1234):

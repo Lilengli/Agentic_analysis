@@ -8,6 +8,35 @@
 #endif
 
 namespace CubeFA {
+template<uint32_t Rows, uint32_t Cols>
+__aicore__ inline void MaskFutureScores(AscendC::LocalTensor<float> scores, uint32_t first_visible)
+{
+    constexpr uint32_t lanes = 64;  // One 256-byte FP32 vector repeat.
+    constexpr uint8_t row_stride = Cols * sizeof(float) / 32;  // In datablocks.
+    constexpr uint64_t all_lanes = ~uint64_t{0};
+    constexpr float blocked_score = -3.402823466e+38F;
+
+    if constexpr (Cols == 2 * lanes) {
+        if (first_visible <= lanes) {
+            const uint32_t full = lanes + 1 - first_visible;
+            const uint8_t repeats = static_cast<uint8_t>(full < Rows ? full : Rows);
+            // In these rows, all of the second 64-column segment is masked.
+            uint64_t mask[2] = {all_lanes, 0};
+            AscendC::Duplicate(scores[lanes], blocked_score, mask, repeats, 1, row_stride);
+        }
+    }
+
+    for (uint32_t row = 0; row < Rows && first_visible + row < Cols; ++row) {
+        const uint32_t visible = first_visible + row;
+        const uint32_t lane = visible % lanes;
+        if (lane == 0) continue;  // The fully masked segment was filled above.
+        // Keep the segment base aligned and preserve its visible prefix.
+        uint64_t mask[2] = {all_lanes << lane, 0};
+        const uint32_t segment_base = visible - lane;
+        AscendC::Duplicate(scores[row * Cols + segment_base], blocked_score, mask, 1, 1, row_stride);
+    }
+}
+
 template<int Core,uint32_t BM,uint32_t BN>
 __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     GM_ADDR relay,uint32_t heads,uint32_t seq,uint32_t groups)
@@ -23,12 +52,16 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
     kgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k),uint64_t(heads)*seq*D);
     vgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v),uint64_t(heads)*seq*D);
     ogm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output),uint64_t(heads)*seq*D);
-    sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),BM*BN);
+    // Score slots live at the start and end of the same per-group relay.
+    sgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset),G::RelayBytes/sizeof(float));
     pgm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(relay+offset+G::SBytes),BM*BN);
     dgm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(relay+offset+G::SBytes+G::PBytes),BM*D);
+    constexpr uint32_t second_score=G::SecondScoreOffset/sizeof(float);
     AscendC::TPipe pipe;
     if constexpr(Core==AscendC::AIC) {
         constexpr uint32_t MaxK=BN>D?BN:D, MaxN=MaxK;
+        constexpr uint32_t L0CSlotElements=BM*MaxN;
+        static_assert(2*L0CSlotElements*sizeof(float)<=128*1024);
         AscendC::TBuf<AscendC::TPosition::A1> qB,pB,bB;
         AscendC::TBuf<AscendC::TPosition::A2> a0B;
         AscendC::TBuf<AscendC::TPosition::B2> b0B;
@@ -38,26 +71,45 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
         pipe.InitBuffer(bB,BN*D*sizeof(half));
         pipe.InitBuffer(a0B,BM*MaxK*sizeof(half));
         pipe.InitBuffer(b0B,BN*D*sizeof(half));
-        pipe.InitBuffer(c0B,BM*MaxN*sizeof(float));
+        pipe.InitBuffer(c0B,2*L0CSlotElements*sizeof(float));
         auto ql=qB.template Get<half>(); auto pl=pB.template Get<half>(); auto bl=bB.template Get<half>();
         auto a0=a0B.template Get<half>(); auto b0=b0B.template Get<half>(); auto c0=c0B.template Get<float>();
+        // Reserve FIX_M and M_FIX event IDs 0 and 1 for these two L0C slots.
+        // Each FIX return releases only the slot its copy read.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+        int32_t accum_slot=0;
         for(uint32_t task=group;task<tasks;task+=groups) {
             const uint32_t head=task/tiles, qs=(task%tiles)*BM;
             const uint64_t base=uint64_t(head)*seq*D;
-            bool first=true;
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN)) {
-                Gemm(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(ks)*D],sgm,
-                    ql,bl,a0,b0,c0,BM,BN,D,Catlass::layout::RowMajor(BM,D),
-                    Catlass::layout::ColumnMajor(D,BN,D),first);
-                first=false;
-                AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+            constexpr int32_t step=BN;
+            const int32_t first_key=(qs/BN)*BN;
+            uint32_t slot=0;
+            for (int32_t qk_key=first_key, pv_key=first_key+step;
+                 pv_key>=0; qk_key-=step, pv_key-=step, slot^=1) {
+                if (qk_key>=0) {
+                    Gemm<true>(pipe,qgm[base+uint64_t(qs)*D],kgm[base+uint64_t(qk_key)*D],
+                        sgm[slot ? second_score : 0],ql,bl,a0,b0,c0[accum_slot*L0CSlotElements],
+                        BM,BN,D,Catlass::layout::RowMajor(BM,D),Catlass::layout::ColumnMajor(D,BN,D),
+                        qk_key==first_key,accum_slot);
+                    accum_slot^=1;
+                    if (slot) AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_NEXT_READY);
+                    else AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(QK_READY);
+                }
+                // Prime QK for the first tile, then consume PV one tile behind.
+                if (pv_key>first_key) continue;
                 AscendC::CrossCoreWaitFlag(P_READY);
-                Gemm(pipe,pgm,vgm[base+uint64_t(ks)*D],dgm,pl,bl,a0,b0,c0,
-                    BM,D,BN,Catlass::layout::RowMajor(BM,BN),Catlass::layout::RowMajor(BN,D));
+                Gemm<true>(pipe,pgm,vgm[base+uint64_t(pv_key)*D],dgm,pl,bl,a0,b0,
+                    c0[accum_slot*L0CSlotElements],BM,D,BN,Catlass::layout::RowMajor(BM,BN),
+                    Catlass::layout::RowMajor(BN,D),true,accum_slot);
+                accum_slot^=1;
                 AscendC::CrossCoreSetFlag<0x2,PIPE_FIX>(PV_READY);
+                // Drain PV before reusing the consumed tile's score slot and the shared relays.
                 AscendC::CrossCoreWaitFlag(TILE_DONE);
             }
         }
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
     } else {
         constexpr uint32_t R=G::Rows;
         AscendC::TBuf<AscendC::TPosition::VECCALC> sB,pB,dB,oB,ohB,mB,lB,alphaB,maxAB,maxBB,sumAB,sumBB;
@@ -78,19 +130,19 @@ __aicore__ inline void RunCore(GM_ADDR q,GM_ADDR k,GM_ADDR v,GM_ADDR output,
             AscendC::Duplicate(l,0.0f,R);
             AscendC::Duplicate(m,-3.402823466e+38F,R);
             AscendC::PipeBarrier<PIPE_V>();
-            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN)) {
-                AscendC::CrossCoreWaitFlag(QK_READY);
+            uint32_t slot=0;
+            for(int32_t ks=(qs/BN)*BN;ks>=0;ks-=int32_t(BN),slot^=1) {
+                if (slot) AscendC::CrossCoreWaitFlag(QK_NEXT_READY);
+                else AscendC::CrossCoreWaitFlag(QK_READY);
                 Sync<AscendC::HardEvent::V_MTE2>(pipe);
-                AscendC::DataCopy(s,sgm[sub*R*BN],R*BN);
+                AscendC::DataCopy(s,sgm[(slot ? second_score : 0)+sub*R*BN],R*BN);
                 Sync<AscendC::HardEvent::MTE2_V>(pipe);
                 AscendC::Muls(s,s,0.08838834764831845f,R*BN);
-                Sync<AscendC::HardEvent::V_S>(pipe);
-                // Only the diagonal key block needs scalar mask edits.
-                if(uint32_t(ks)==(qs/BN)*BN) for(uint32_t r=0;r<R;++r) {
-                    const uint32_t visible=qs+sub*R+r-uint32_t(ks)+1;
-                    for(uint32_t j=visible;j<BN;++j) s.SetValue(r*BN+j,-3.402823466e+38F);
+                AscendC::PipeBarrier<PIPE_V>();
+                if(uint32_t(ks)==(qs/BN)*BN) {
+                    MaskFutureScores<R,BN>(s, qs+sub*R-uint32_t(ks)+1);
+                    AscendC::PipeBarrier<PIPE_V>();
                 }
-                Sync<AscendC::HardEvent::S_V>(pipe);
                 AscendC::WholeReduceMax(maxA,s,64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
                 if constexpr(BN==128) {
                     AscendC::WholeReduceMax(maxB,s[64],64,R,1,1,BN/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
